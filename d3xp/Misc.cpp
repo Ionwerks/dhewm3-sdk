@@ -36,6 +36,7 @@ Various utility objects and functions.
 
 #include "gamesys/SysCvar.h"
 #include "script/Script_Thread.h"
+#include "framework/async/NetworkSystem.h" //added for coop
 #include "ai/AI.h"
 #include "Player.h"
 #include "Camera.h"
@@ -44,6 +45,9 @@ Various utility objects and functions.
 #include "SmokeParticles.h"
 
 #include "Misc.h"
+
+// added for coop
+const int COOP_TELEPORT_CLEARDELAY = 1000; //1 sec
 
 /*
 ===============================================================================
@@ -67,6 +71,62 @@ idSpawnableEntity::Spawn
 */
 void idSpawnableEntity::Spawn() {
 	// this just holds dict information
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer && idStr::Cmp(this->GetEntityDefName(), "wraith_spawneffect") == 0) { //Dirty hack for wraith spawn effect!
+		
+		if (!fl.coopNetworkSync) {
+			fl.networkSync = true;
+			fl.coopNetworkSync = true;
+			gameLocal.RegisterCoopEntity( this ); 
+		}
+	}
+}
+
+/*
+=====================
+idSpawnableEntity::WriteToSnapshot
+=====================
+*/
+void idSpawnableEntity::WriteToSnapshot(idBitMsgDelta& msg) const {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		idEntity::WriteBindToSnapshot(msg);
+		return;
+	}
+	msg.WriteFloat(GetPhysics()->GetOrigin().x);
+	msg.WriteFloat(GetPhysics()->GetOrigin().y);
+	msg.WriteFloat(GetPhysics()->GetOrigin().z);
+	msg.WriteFloat(renderEntity.shaderParms[SHADERPARM_TIMEOFFSET]);
+	msg.WriteBits(fl.hidden, 1);
+}
+
+/*
+=====================
+idSpawnableEntity::ReadFromSnapshot
+=====================
+*/
+void idSpawnableEntity::ReadFromSnapshot(const idBitMsgDelta& msg) {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		idEntity::ReadFromSnapshot(msg);
+		return;
+	}
+
+	idVec3	tmpOrigin = vec3_zero;
+
+	tmpOrigin.x = msg.ReadFloat();
+	tmpOrigin.y = msg.ReadFloat();
+	tmpOrigin.z = msg.ReadFloat();
+	renderEntity.shaderParms[SHADERPARM_TIMEOFFSET] = msg.ReadFloat();
+
+	if (msg.ReadBits(1)) { //fl.hidden from server
+		Hide();
+	} else {
+		Show();
+	}
+
+	if (msg.HasChanged()) {
+		SetOrigin(tmpOrigin);
+		UpdateVisuals();
+	}
 }
 
 /*
@@ -78,10 +138,14 @@ void idSpawnableEntity::Spawn() {
 */
 
 const idEventDef EV_TeleportStage( "<TeleportStage>", "e" );
+const idEventDef EV_Spawn_Enable( "enable", NULL ); //added for OpenCoop maps compatibility
+const idEventDef EV_Spawn_Disable( "disable", NULL ); //added for OpenCoop maps compatibility
 
 CLASS_DECLARATION( idEntity, idPlayerStart )
 	EVENT( EV_Activate,			idPlayerStart::Event_TeleportPlayer )
 	EVENT( EV_TeleportStage,	idPlayerStart::Event_TeleportStage )
+	EVENT( EV_Spawn_Enable,		idPlayerStart::Event_Enable ) //added for OpenCoop maps compatibility
+	EVENT( EV_Spawn_Disable,	idPlayerStart::Event_Disable ) //added for OpenCoop maps compatibility
 END_CLASS
 
 /*
@@ -201,6 +265,11 @@ void idPlayerStart::TeleportPlayer( idPlayer *player ) {
 	SetTimeState ts( player->timeGroup );
 #endif
 
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) { //create a new global checkpoint at this position for Coop
+		player->nextTimeCoopTeleported = gameLocal.time + COOP_TELEPORT_CLEARDELAY;
+		gameLocal.mpGame.CreateNewCheckpoint(GetPhysics()->GetOrigin());
+	}
+
 	if ( f && ent ) {
 		// place in private camera view for some time
 		// the entity needs to teleport to where the camera view is to have the PVS right
@@ -212,6 +281,11 @@ void idPlayerStart::TeleportPlayer( idPlayer *player ) {
 			player->PostEventSec( &EV_Player_ExitTeleporter, f );
 		}
 	} else {
+
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+			ActivateTargets(this); //for opencoop
+		}
+
 		// direct to exit, Teleport will take care of the killbox
 		player->Teleport( GetPhysics()->GetOrigin(), GetPhysics()->GetAxis().ToAngles(), NULL );
 
@@ -230,12 +304,26 @@ idPlayerStart::Event_TeleportPlayer
 void idPlayerStart::Event_TeleportPlayer( idEntity *activator ) {
 	idPlayer *player;
 
-	if ( activator->IsType( idPlayer::Type ) ) {
+	if (activator && !activator->IsType(idPlayer::Type) && activator->entityNumber != this->entityNumber) { //for OpenCoop teleport target support
+		for (int i=0; i < gameLocal.numClients; i++) {
+			idPlayer *p = gameLocal.GetClientByNum(i);
+			if (!p || p->nextTimeCoopTeleported >= gameLocal.time) {
+				continue;
+			}
+			activator = p;
+			break;
+		}
+	}
+
+	if (activator && activator->IsType( idPlayer::Type ) ) { //edited to avoid crash in coop
 		player = static_cast<idPlayer*>( activator );
+	} else if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.GetCoopPlayer()) {
+		player = gameLocal.GetCoopPlayer();
 	} else {
 		player = gameLocal.GetLocalPlayer();
 	}
 	if ( player ) {
+		player->nextTimeCoopTeleported = gameLocal.time + COOP_TELEPORT_CLEARDELAY;
 		if ( spawnArgs.GetBool( "visualFx" ) ) {
 
 			teleportStage = 0;
@@ -256,6 +344,54 @@ void idPlayerStart::Event_TeleportPlayer( idEntity *activator ) {
 			TeleportPlayer( player );
 		}
 	}
+}
+
+/*
+===============
+idPlayerStart::Event_Enable
+================
+*/
+void idPlayerStart::Event_Enable( void ) 
+{
+	if (spawnArgs.GetBool( "initial" ) && (gameLocal.initialSpots.FindIndex(this) < 0)) {
+		gameLocal.initialSpots.Append(this);
+	}
+	int spawnSpotIndex=-1;
+	for (int i=0; i < gameLocal.spawnSpots.Num(); i++) {
+		if (gameLocal.spawnSpots[i].ent && (gameLocal.spawnSpots[i].ent->entityNumber == this->entityNumber)) {
+			spawnSpotIndex = i;
+			break;
+		}
+	} 
+	if (spawnSpotIndex < 0) {
+		spawnSpot_t	spot;
+		spot.dist = 0;
+		spot.ent = this;
+		gameLocal.spawnSpots.Append(spot);
+	}
+
+}
+
+/*
+===============
+idPlayerStart::Event_Disable
+================
+*/
+void idPlayerStart::Event_Disable( void ) {
+
+	gameLocal.initialSpots.Remove(this);
+
+	int spawnSpotIndex=-1;
+	for (int i=0; i < gameLocal.spawnSpots.Num(); i++) {
+		if (gameLocal.spawnSpots[i].ent && (gameLocal.spawnSpots[i].ent->entityNumber == this->entityNumber)) {
+			spawnSpotIndex = i;
+			break;
+		}
+	} 
+	if (spawnSpotIndex >= 0) {
+		gameLocal.spawnSpots.RemoveIndex(spawnSpotIndex);
+	}
+
 }
 
 /*
@@ -447,6 +583,7 @@ idDamagable::idDamagable
 idDamagable::idDamagable( void ) {
 	count = 0;
 	nextTriggerTime = 0;
+	allowRemoveSync = true; //coop
 }
 
 /*
@@ -637,12 +774,18 @@ idExplodable::Event_Explode
 ================
 */
 void idExplodable::Event_Explode( idEntity *activator ) {
-	const char *temp;
 
-	if ( spawnArgs.GetString( "def_damage", "damage_explosion", &temp ) ) {
-		gameLocal.RadiusDamage( GetPhysics()->GetOrigin(), activator, activator, this, this, temp );
+	if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased())
+	{
+		ServerSendEvent(EVENT_EXPLODE, NULL, false, gameLocal.localClientNum);
+
+		const char* temp;
+
+		if (spawnArgs.GetString("def_damage", "damage_explosion", &temp)) {
+			gameLocal.RadiusDamage(GetPhysics()->GetOrigin(), activator, activator, this, this, temp);
+		}
+
 	}
-
 	StartSound( "snd_explode", SND_CHANNEL_ANY, 0, false, NULL );
 
 	// Show() calls UpdateVisuals, so we don't need to call it ourselves after setting the shaderParms
@@ -654,9 +797,33 @@ void idExplodable::Event_Explode( idEntity *activator ) {
 	renderEntity.shaderParms[SHADERPARM_DIVERSITY]	= 0.0f;
 	Show();
 
-	PostEventMS( &EV_Remove, 2000 );
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		CS_PostEventMS(&EV_Remove, 2000);
+	}
+	else {
+		PostEventMS(&EV_Remove, 2000);
+	}
 
 	ActivateTargets( activator );
+}
+
+/*
+================
+idExplodable::ClientReceiveEvent
+================
+*/
+
+bool idExplodable::ClientReceiveEvent(int event, int time, const idBitMsg& msg)
+{
+	switch (event)
+	{
+	case EVENT_EXPLODE: {
+		Event_Explode(NULL);
+		return true;
+	}
+	}
+
+	return idEntity::ClientReceiveEvent(event, time, msg);
 }
 
 
@@ -946,6 +1113,8 @@ idAnimated::idAnimated
 */
 idAnimated::idAnimated() {
 	anim = 0;
+	currentAnimPlaying = 0; //FOR COOP
+	hasBeenActivated = false; //FOR COOP
 	blendFrames = 0;
 	soundJoint = INVALID_JOINT;
 	activated = false;
@@ -953,7 +1122,7 @@ idAnimated::idAnimated() {
 	activator = NULL;
 	current_anim_index = 0;
 	num_anims = 0;
-
+	canBeCsTarget = true; //added for coop
 }
 
 /*
@@ -1065,6 +1234,8 @@ void idAnimated::Spawn( void ) {
 
 	spawnArgs.GetFloat( "wait", "-1", wait );
 
+	currentAnimPlaying = animator.CurrentAnim( ANIMCHANNEL_ALL )->AnimNum(); //for coop
+
 	if ( wait >= 0 ) {
 		PostEventSec( &EV_Activate, wait, this );
 	}
@@ -1171,7 +1342,11 @@ void idAnimated::PlayNextAnim( void ) {
 
 	len = animator.CurrentAnim( ANIMCHANNEL_ALL )->PlayLength();
 	if ( len >= 0 ) {
-		PostEventMS( &EV_AnimDone, len, current_anim_index );
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+			CS_PostEventMS( &EV_AnimDone, len, current_anim_index );
+		} else {
+			PostEventMS( &EV_AnimDone, len, current_anim_index );
+		}
 	}
 
 	// offset the start time of the shader to sync it to the game time
@@ -1205,11 +1380,19 @@ void idAnimated::Event_AnimDone( int animindex ) {
 
 	if ( ( animindex >= num_anims ) && spawnArgs.GetBool( "remove" ) ) {
 		Hide();
-		PostEventMS( &EV_Remove, 0 );
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+			CS_PostEventMS( &EV_Remove, 0 );
+		} else {
+			PostEventMS( &EV_Remove, 0 );
+		}
 	} else if ( spawnArgs.GetBool( "auto_advance" ) ) {
 		PlayNextAnim();
 	} else {
 		activated = false;
+	}
+
+	if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) {
+		return;
 	}
 
 	ActivateTargets( activator.GetEntity() );
@@ -1233,6 +1416,7 @@ void idAnimated::Event_Activate( idEntity *_activator ) {
 	}
 
 	activated = true;
+	hasBeenActivated = true; //for coop only
 	activator = _activator;
 	ProcessEvent( &EV_Animated_Start );
 }
@@ -1264,7 +1448,11 @@ void idAnimated::Event_Start( void ) {
 
 		len = animator.CurrentAnim( ANIMCHANNEL_ALL )->PlayLength();
 		if ( len >= 0 ) {
-			PostEventMS( &EV_AnimDone, len, 1 );
+			if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+				CS_PostEventMS( &EV_AnimDone, len, 1 );
+			} else {
+				PostEventMS( &EV_AnimDone, len, 1 );
+			}
 		}
 	}
 
@@ -1292,6 +1480,11 @@ idAnimated::Event_LaunchMissilesUpdate
 =====================
 */
 void idAnimated::Event_LaunchMissilesUpdate( int launchjoint, int targetjoint, int numshots, int framedelay ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return;
+	}
+
 	idVec3			launchPos;
 	idVec3			targetPos;
 	idMat3			axis;
@@ -1300,7 +1493,6 @@ void idAnimated::Event_LaunchMissilesUpdate( int launchjoint, int targetjoint, i
 	idProjectile *	projectile;
 	const idDict *	projectileDef;
 	const char *	projectilename;
-
 	projectilename = spawnArgs.GetString( "projectilename" );
 	projectileDef = gameLocal.FindEntityDefDict( projectilename, false );
 	if ( !projectileDef ) {
@@ -1319,7 +1511,8 @@ void idAnimated::Event_LaunchMissilesUpdate( int launchjoint, int targetjoint, i
 	dir = targetPos - launchPos;
 	dir.Normalize();
 
-	gameLocal.SpawnEntityDef( *projectileDef, &ent, false );
+	gameLocal.SpawnEntityDef(*projectileDef, &ent, false);
+	
 	if ( !ent || !ent->IsType( idProjectile::Type ) ) {
 		gameLocal.Error( "idAnimated '%s' at (%s): in 'launchMissiles' call '%s' is not an idProjectile", name.c_str(), GetPhysics()->GetOrigin().ToString(0), projectilename );
 	}
@@ -1338,6 +1531,11 @@ idAnimated::Event_LaunchMissiles
 =====================
 */
 void idAnimated::Event_LaunchMissiles( const char *projectilename, const char *sound, const char *launchjoint, const char *targetjoint, int numshots, int framedelay ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return;
+	}
+
 	const idDict *	projectileDef;
 	jointHandle_t	launch;
 	jointHandle_t	target;
@@ -1399,6 +1597,101 @@ void idAnimated::Event_GetAnimationLength() {
 }
 #endif
 
+//STRADEX COOP METHODS START
+
+/*
+=====================
+idAnimated::Think
+=====================
+*/
+void idAnimated::Think( void ) {
+	idAFEntity_Gibbable::Think();
+
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		return;
+	}
+	//coop stuff
+	currentAnimPlaying = animator.CurrentAnim( ANIMCHANNEL_ALL )->AnimNum();
+}
+
+/*
+=====================
+idAnimated::ClientPredictionThink
+=====================
+*/
+void idAnimated::ClientPredictionThink( void ) {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		idAFEntity_Gibbable::ClientPredictionThink();
+		return;
+	}
+	//coop stuff
+	UpdateAnimation();
+	UpdateVisuals();
+	Present();
+	//UpdateDamageEffects();
+	//LinkCombat();
+}
+
+/*
+=====================
+idAnimated::WriteToSnapshot
+=====================
+*/
+void idAnimated::WriteToSnapshot( idBitMsgDelta &msg ) const {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		idAFEntity_Gibbable::WriteBindToSnapshot(msg);
+		return;
+	}
+
+	//common->Warning("[COOP] sending snapshot for %s\n", this->GetName());
+	//FIXME: Snapshot being sended every single f*cking frame
+	//coop stuff
+	WriteBindToSnapshot( msg );
+	msg.WriteShort(currentAnimPlaying);
+	msg.WriteBits(hasBeenActivated, 1);
+}
+
+/*
+=====================
+idAnimated::WriteToSnapshot
+=====================
+*/
+void idAnimated::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		idAFEntity_Gibbable::ReadFromSnapshot(msg);
+		return;
+	}
+
+	int newAnim;
+	bool newActivated;
+	//coop stuff
+	ReadBindFromSnapshot( msg );
+	newAnim = msg.ReadShort();
+	newActivated = msg.ReadBits( 1 ) != 0;
+
+	//common->Warning("[COOP] reading snapshot for %s\n", this->GetName());
+
+	if ((newAnim != this->currentAnimPlaying) || (newActivated != this->hasBeenActivated)) {
+		this->activated = newActivated;
+		this->hasBeenActivated = newActivated;
+		this->currentAnimPlaying = newAnim;
+		int cycle;
+		Show();
+		spawnArgs.GetInt( "cycle", "1", cycle );
+		animator.CycleAnim( ANIMCHANNEL_ALL, this->currentAnimPlaying, gameLocal.time, FRAME2MS( blendFrames ) );
+		animator.CurrentAnim( ANIMCHANNEL_ALL )->SetCycleCount( cycle );
+		renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] = -MS2SEC( gameLocal.time );
+		animator.ForceUpdate();
+		//common->Warning("[COOP] New animation for %s\n", this->GetName());
+	}
+	if ( msg.HasChanged() ) {
+		UpdateVisuals();
+	}
+}
+
+//STRADEX COOP METHODS END
+
+
 /*
 ===============================================================================
 
@@ -1411,6 +1704,9 @@ void idAnimated::Event_GetAnimationLength() {
 
 CLASS_DECLARATION( idEntity, idStaticEntity )
 	EVENT( EV_Activate,				idStaticEntity::Event_Activate )
+	EVENT( EV_Remove,				idStaticEntity::Event_Remove ) //added for coop
+	EVENT( EV_Hide,					idStaticEntity::Event_Hide )
+	EVENT( EV_Show,					idStaticEntity::Event_Show )
 END_CLASS
 
 /*
@@ -1426,6 +1722,8 @@ idStaticEntity::idStaticEntity( void ) {
 	fadeStart = 0;
 	fadeEnd	= 0;
 	runGui = false;
+	canBeCsTarget = true;
+	eventSyncVital = false; //to avoid overflow! (this could be a problem, needs testing)
 }
 
 /*
@@ -1588,6 +1886,13 @@ idStaticEntity::Event_Activate
 ================
 */
 void idStaticEntity::Event_Activate( idEntity *activator ) {
+
+	//hack for coop start
+	bool wasCalledViaScript = calledViaScriptThread;
+	calledViaScriptThread = false;
+	//hack for coop ends 
+
+
 	idStr activateGui;
 
 	spawnTime = gameLocal.time;
@@ -1600,6 +1905,16 @@ void idStaticEntity::Event_Activate( idEntity *activator ) {
 		} else {
 			Hide();
 		}
+
+		if ( gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()  && wasCalledViaScript ) { //extra sync for coop
+			idBitMsg	msg;
+			byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+
+			msg.Init( msgBuf, sizeof( msgBuf ) );
+			msg.WriteBits( IsHidden(), 1 );
+			ServerSendEvent( EVENT_STATIC_ACTIVATE, &msg, true, -1, true ); //saveLastOnly  = true to only save the last event from this entity
+		}
+
 	}
 
 	renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] = -MS2SEC( spawnTime );
@@ -1609,6 +1924,15 @@ void idStaticEntity::Event_Activate( idEntity *activator ) {
 	// with trigger parms.. it MIGHT break things so need to keep an eye on it
 	renderEntity.shaderParms[ SHADERPARM_MODE ] = ( renderEntity.shaderParms[ SHADERPARM_MODE ] ) ?  0.0f : 1.0f;
 	BecomeActive( TH_UPDATEVISUALS );
+}
+
+/*
+================
+idStaticEntity::ClientPredictionThink
+================
+*/
+void idStaticEntity::ClientPredictionThink( void ) {
+	Think();
 }
 
 /*
@@ -1649,6 +1973,88 @@ void idStaticEntity::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	}
 }
 
+//COOP STUFF
+
+/*
+================
+idStaticEntity::Event_Remove
+================
+*/
+void idStaticEntity::Event_Remove( void ) {
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent( EVENT_STATIC_REMOVE, NULL, true, -1 );
+	}
+	delete this;
+}
+
+
+/*
+================
+idStaticEntity::Event_Hide
+================
+*/
+void idStaticEntity::Event_Hide( void ) {
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent( EVENT_STATIC_HIDE, NULL, true, -1 , true);
+	}
+	Hide();
+}
+
+
+/*
+================
+idStaticEntity::Event_Show
+================
+*/
+void idStaticEntity::Event_Show( void ) {
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent( EVENT_STATIC_SHOW, NULL, true, -1 , true);
+	}
+	Show();
+}
+
+
+/*
+================
+idStaticEntity::ClientReceiveEvent
+================
+*/
+bool idStaticEntity::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		return idEntity::ClientReceiveEvent( event, time, msg ); //OG D3 netcode non-coop
+	}
+	switch( event ) {
+		case EVENT_STATIC_ACTIVATE: {
+			if ( msg.ReadBits( 1 ) ) {
+				Hide();
+			} else {
+				Show();
+			}
+			UpdateVisuals();
+			return true;
+		}
+		case EVENT_STATIC_REMOVE: {
+			CS_PostEventMS( &EV_Remove, 0 );
+			return true;
+		}
+		case EVENT_STATIC_HIDE: {
+			Event_Hide();
+			UpdateVisuals();
+			return true;
+		}
+		case EVENT_STATIC_SHOW: {
+			Event_Show();
+			UpdateVisuals();
+			return true;
+		}
+		default:
+			break;
+	}
+
+	return idEntity::ClientReceiveEvent( event, time, msg );
+}
+//END COOP STUFF
+
 
 /*
 ===============================================================================
@@ -1670,6 +2076,7 @@ idFuncEmitter::idFuncEmitter
 */
 idFuncEmitter::idFuncEmitter( void ) {
 	hidden = false;
+	canBeCsTarget = true;
 }
 
 /*
@@ -1747,6 +2154,162 @@ void idFuncEmitter::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	}
 }
 
+//added for LM
+
+/*
+===============================================================================
+idFuncShootProjectile
+===============================================================================
+*/
+
+
+CLASS_DECLARATION( idStaticEntity, idFuncShootProjectile )
+	EVENT( EV_Activate,				idFuncShootProjectile::Event_Activate )
+	END_CLASS
+
+	/*
+	===============
+	idFuncShootProjectile::idFuncShootProjectile
+	===============
+	*/
+	idFuncShootProjectile::idFuncShootProjectile() {
+		mRespawnDelay = 1000;
+		mRespawnTime = 0;
+		mShootSpeed = 1000;
+		mShootDir = idVec3( 0.0f, 0.0f, 1.0f );
+}
+
+/*
+===============
+idFuncShootProjectile::Spawn
+===============
+*/
+void idFuncShootProjectile::Spawn() {
+}
+
+/*
+===============
+idFuncShootProjectile::Think
+===============
+*/
+void idFuncShootProjectile::Think() {
+	if ( thinkFlags & TH_THINK ) {
+		// time to spawn a new projectile?
+		if ( mRespawnTime > 0 && mRespawnTime <= gameLocal.GetTime() ) {
+			const idDict *dict = gameLocal.FindEntityDefDict( mEntityDefName );
+			idEntity *ent = NULL;
+			gameLocal.SpawnEntityDef( *dict, &ent );
+			if ( ent != NULL ) {
+				idProjectile *proj = static_cast<idProjectile *>(ent);
+
+				idVec3 pushVel = mShootDir * mShootSpeed;
+				proj->Create( this, GetPhysics()->GetOrigin(), mShootDir );
+				proj->Launch( GetPhysics()->GetOrigin(), mShootDir, pushVel );
+				if ( mShootSpeed == 0.0f ) {
+					proj->GetPhysics()->SetLinearVelocity( vec3_zero );
+				} else {
+					proj->GetPhysics()->SetLinearVelocity( pushVel );
+				}
+
+				mLastProjectile = proj;
+			}
+			if ( mShootSpeed == 0.0f ) {
+				mRespawnTime = 0;	// stationary, respawn when triggered
+			} else {
+				mRespawnTime = gameLocal.GetTime() + mRespawnDelay;		// moving, respawn after delay
+			}
+		}
+	}
+}
+
+/*
+===============
+idFuncShootProjectile::Save
+===============
+*/
+void idFuncShootProjectile::Save( idSaveGame *savefile ) const {
+	savefile->WriteInt( mRespawnDelay );
+	savefile->WriteInt( mRespawnTime );
+	savefile->WriteFloat( mShootSpeed );
+	savefile->WriteVec3( mShootDir );
+	savefile->WriteString( mEntityDefName );
+}
+
+/*
+===============
+idFuncShootProjectile::Restore
+===============
+*/
+void idFuncShootProjectile::Restore( idRestoreGame *savefile ) {
+	savefile->ReadInt( mRespawnDelay );
+	savefile->ReadInt( mRespawnTime );
+	savefile->ReadFloat( mShootSpeed );
+	savefile->ReadVec3( mShootDir );
+	savefile->ReadString( mEntityDefName );
+}
+
+/*
+================
+idFuncShootProjectile::Event_Activate
+================
+*/
+void idFuncShootProjectile::Event_Activate( idEntity *activator ) {
+	if ( ( thinkFlags & TH_THINK ) != 0 ) {
+		if ( mShootSpeed == 0.0f && mRespawnTime == 0 ) {
+			mRespawnTime = gameLocal.GetTime();
+			return;
+		}
+	}
+
+	mRespawnDelay = spawnArgs.GetInt( "spawn_delay_ms" );
+	mShootSpeed = spawnArgs.GetFloat( "speed" );
+	mEntityDefName = spawnArgs.GetString( "def_projectile" );
+	if ( targets.Num() > 0 && targets[0].IsValid() ) {
+		mShootDir = targets[0]->GetPhysics()->GetOrigin() - GetPhysics()->GetOrigin();
+		//mShootDir = targets[0].GetPhysics()->GetOrigin() - GetPhysics()->GetOrigin();
+		mShootDir.Normalize();
+	} else {
+		// stationary projectile, doesn't move and only respawns when triggered
+		mShootSpeed = 0.0f;
+		mRespawnTime = 0;
+	}
+
+	if ( ( thinkFlags & TH_THINK ) != 0 ) {
+		// currently active, deactivate
+		BecomeInactive( TH_THINK );
+	} else {
+		// currently inactive, activate
+		BecomeActive( TH_THINK );
+		mRespawnTime = gameLocal.GetTime();
+	}
+}
+
+/*
+================
+idFuncShootProjectile::WriteToSnapshot
+================
+*/
+void idFuncShootProjectile::WriteToSnapshot( idBitMsg &msg ) const {
+	// 	msg.WriteBits( hidden ? 1 : 0, 1 );
+	// 	msg.WriteFloat( renderEntity.shaderParms[ SHADERPARM_PARTICLE_STOPTIME ] );
+	// 	msg.WriteFloat( renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] );
+}
+
+/*
+================
+idFuncShootProjectile::ReadFromSnapshot
+================
+*/
+void idFuncShootProjectile::ReadFromSnapshot( const idBitMsg &msg ) {
+	// 	hidden = msg.ReadBits( 1 ) != 0;
+	// 	renderEntity.shaderParms[ SHADERPARM_PARTICLE_STOPTIME ] = msg.ReadFloat();
+	// 	renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] = msg.ReadFloat();
+	// 	if ( msg.HasChanged() ) {
+	// 		UpdateVisuals();
+	// 	}
+}
+
+//end for the LM
 
 /*
 ===============================================================================
@@ -2129,7 +2692,14 @@ idLocationEntity
 ===============================================================================
 */
 
+const idEventDef EV_NumPlayers( "numPlayers", NULL, 'd' ); //added for OpenCoop maps support
+const idEventDef EV_AllPlayersIn( "allPlayersIn", NULL, 'd' ); //added for OpenCoop maps support
+const idEventDef EV_NoPlayersIn( "noPlayersIn", NULL, 'd' ); //added for OpenCoop maps support
+
 CLASS_DECLARATION( idEntity, idLocationEntity )
+	EVENT( EV_NumPlayers,	idLocationEntity::Event_NumPlayers )
+	EVENT( EV_AllPlayersIn,	idLocationEntity::Event_AllPlayersIn )
+	EVENT( EV_NoPlayersIn,	idLocationEntity::Event_NoPlayersIn )
 END_CLASS
 
 /*
@@ -2158,6 +2728,71 @@ const char *idLocationEntity::GetLocation( void ) const {
 }
 
 /*
+======================
+idLocationEntity::GetPlayersIn
+======================
+*/
+int	idLocationEntity::GetPlayersIn( void ) const {
+	int playersInside=0;
+
+	for (int i=0; i < gameLocal.numClients; i++) {
+		idPlayer *client = gameLocal.GetClientByNum(i);
+
+		if (!client || client->spectating) {
+			continue;
+		}
+		idLocationEntity *locationEntity = gameLocal.LocationForPoint( client->GetEyePosition() );
+		if ( locationEntity && (locationEntity->entityNumber == this->entityNumber) ) {
+			playersInside++;
+		}
+	}
+
+	return playersInside;
+}
+
+//Events for OPENCOOP maps compatibility
+
+/*
+======================
+idLocationEntity::Event_NumPlayers
+======================
+*/
+void	idLocationEntity::Event_NumPlayers( void )
+{
+	idThread::ReturnInt( GetPlayersIn() );
+}
+
+/*
+======================
+idLocationEntity::Event_AllPlayersIn
+======================
+*/
+void	idLocationEntity::Event_AllPlayersIn( void )
+{
+	int totalPlayers=0;
+
+	for (int i=0; i < gameLocal.numClients; i++) {
+		idPlayer *client = gameLocal.GetClientByNum(i);
+
+		if (!client || client->spectating) {
+			continue;
+		}
+		totalPlayers++;
+	}
+
+	idThread::ReturnInt( GetPlayersIn() == totalPlayers );
+}
+/*
+======================
+idLocationEntity::Event_NoPlayersIn
+======================
+*/
+void	idLocationEntity::Event_NoPlayersIn( void )
+{
+	idThread::ReturnInt( GetPlayersIn() == 0 );
+}
+
+/*
 ===============================================================================
 
 	idBeam
@@ -2168,6 +2803,7 @@ const char *idLocationEntity::GetLocation( void ) const {
 CLASS_DECLARATION( idEntity, idBeam )
 	EVENT( EV_PostSpawn,			idBeam::Event_MatchTarget )
 	EVENT( EV_Activate,				idBeam::Event_Activate )
+	EVENT( EV_Remove,				idBeam::Event_Remove ) //added for coop
 END_CLASS
 
 /*
@@ -2178,6 +2814,8 @@ idBeam::idBeam
 idBeam::idBeam() {
 	target = NULL;
 	master = NULL;
+	canBeCsTarget = true;
+	eventSyncVital = false;
 }
 
 /*
@@ -2214,7 +2852,11 @@ void idBeam::Spawn( void ) {
 
 	SetModel( "_BEAM" );
 	Hide();
-	PostEventMS( &EV_PostSpawn, 0 );
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		CS_PostEventMS( &EV_PostSpawn, 0 );
+	} else {
+		PostEventMS( &EV_PostSpawn, 0 );
+	}
 }
 
 /*
@@ -2320,10 +2962,25 @@ idBeam::Event_Activate
 ================
 */
 void idBeam::Event_Activate( idEntity *activator ) {
+
+	//hack for coop start
+	bool wasCalledViaScript = calledViaScriptThread;
+	calledViaScriptThread = false;
+	//hack for coop ends 
+
 	if ( IsHidden() ) {
 		Show();
 	} else {
 		Hide();
+	}
+
+	if ( gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased() && wasCalledViaScript ) { //extra sync for coop
+		idBitMsg	msg;
+		byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+
+		msg.Init( msgBuf, sizeof( msgBuf ) );
+		msg.WriteBits( IsHidden()?1:0, 1 );
+		ServerSendEvent( EVENT_BEAM_ACTIVATE, &msg, true, -1, true ); //saveLastOnly  = true to only save the last event from this entity
 	}
 }
 
@@ -2357,6 +3014,79 @@ void idBeam::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 		UpdateVisuals();
 	}
 }
+
+//COOP STUFF
+
+/*
+================
+idBeam::Event_Remove
+================
+*/
+void idBeam::Event_Remove( void ) {
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent( EVENT_BEAM_REMOVE, NULL, true, -1 );
+	}
+	delete this;
+}
+
+
+/*
+================
+idBeam::ClientReceiveEvent
+================
+*/
+bool idBeam::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		return idEntity::ClientReceiveEvent( event, time, msg ); //OG D3 netcode non-coop
+	}
+	switch( event ) {
+		case EVENT_BEAM_ACTIVATE: {
+			bool hidden = (msg.ReadBits( 1 ) != 0);
+			if ( hidden != IsHidden() ) {
+				if ( hidden ) {
+					Hide();
+				} else {
+					Show();
+				}
+
+				UpdateVisuals();
+			}
+			return true;
+		}
+		case EVENT_BEAM_REMOVE: {
+			CS_PostEventMS( &EV_Remove, 0 );
+			return true;
+		}
+		default:
+			break;
+	}
+
+	return idEntity::ClientReceiveEvent( event, time, msg );
+}
+
+/*
+================
+idBeam::ClientPredictionThink
+================
+*/
+void idBeam::ClientPredictionThink( void ) {
+	idBeam *masterEnt;
+
+	if ( !IsHidden() && !target.GetEntity() ) {
+		// hide if our target is removed
+		Hide();
+	}
+
+	RunPhysics();
+
+	masterEnt = master.GetEntity();
+	if ( masterEnt ) {
+		const idVec3 &origin = GetPhysics()->GetOrigin();
+		masterEnt->SetBeamTarget( origin );
+	}
+	Present();
+}
+//END COOP STUFF
 
 
 /*
@@ -2890,6 +3620,7 @@ idFuncRadioChatter::idFuncRadioChatter
 */
 idFuncRadioChatter::idFuncRadioChatter() {
 	time = 0.0;
+	canBeCsTarget = true;
 }
 
 /*
@@ -2925,28 +3656,58 @@ idFuncRadioChatter::Event_Activate
 ================
 */
 void idFuncRadioChatter::Event_Activate( idEntity *activator ) {
+
+	//hack for coop start
+	bool wasCalledViaScript = calledViaScriptThread;
+	calledViaScriptThread = false;
+	//hack for coop ends 
+
 	idPlayer *player;
 	const char	*sound;
 	const idSoundShader *shader;
 	int length;
 
-	if ( activator->IsType( idPlayer::Type ) ) {
+	if (activator && activator->IsType( idPlayer::Type ) && !gameLocal.isClient ) {
 		player = static_cast<idPlayer *>( activator );
+	} else if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		player = gameLocal.GetCoopPlayer();
 	} else {
-		player = gameLocal.GetLocalPlayer();
+		player = gameLocal.GetLocalPlayer(); // for this for clients in coop
 	}
 
-	player->hud->HandleNamedEvent( "radioChatterUp" );
+	if (!player && gameLocal.mpGame.IsGametypeCoopBased()) { //ERROR!
+		common->Warning("[COOP] No player detected at idFuncRadioChatter::Event_Activate!\n");
+		return;
+	}
+
+	if (player->hud) {
+		player->hud->HandleNamedEvent( "radioChatterUp" );
+	}
+
 
 	sound = spawnArgs.GetString( "snd_radiochatter", "" );
 	if ( sound && *sound ) {
 		shader = declManager->FindSound( sound );
 		player->StartSoundShader( shader, SND_CHANNEL_RADIO, SSF_GLOBAL, false, &length );
 		time = MS2SEC( length + 150 );
+
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer && wasCalledViaScript) {
+			idBitMsg outMsg;
+			byte msgBuf[1024];
+			outMsg.Init( msgBuf, sizeof( msgBuf ) );
+			outMsg.WriteByte( GAME_RELIABLE_MESSAGE_SOUND_INDEX );
+			outMsg.WriteInt( gameLocal.ServerRemapDecl( -1, DECL_SOUND, shader->Index() ) );
+			networkSystem->ServerSendReliableMessage( -1, outMsg );
+			gameLocal.DebugPrintf("Sending idFuncRadioChatter::Event_Activate\n");
+		}
 	}
 	// we still put the hud up because this is used with no sound on
 	// certain frame commands when the chatter is triggered
-	PostEventSec( &EV_ResetRadioHud, time, player );
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		CS_PostEventSec( &EV_ResetRadioHud, time, player );
+	} else {
+		PostEventSec( &EV_ResetRadioHud, time, player );
+	}
 
 }
 
@@ -2956,8 +3717,22 @@ idFuncRadioChatter::Event_ResetRadioHud
 ================
 */
 void idFuncRadioChatter::Event_ResetRadioHud( idEntity *activator ) {
-	idPlayer *player = ( activator->IsType( idPlayer::Type ) ) ? static_cast<idPlayer *>( activator ) : gameLocal.GetLocalPlayer();
-	player->hud->HandleNamedEvent( "radioChatterDown" );
+	idPlayer *player;
+
+	if (activator && activator->IsType( idPlayer::Type ) && !gameLocal.isClient ) {
+		player = static_cast<idPlayer *>( activator );
+	} else if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		player = gameLocal.GetCoopPlayer();
+	} else {
+		player = gameLocal.GetLocalPlayer(); // for this for clients in coop
+	}
+
+	if (player->hud) {
+		player->hud->HandleNamedEvent( "radioChatterDown" );
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) 
+		return;
 	ActivateTargets( activator );
 }
 

@@ -47,7 +47,12 @@ If you have questions concerning this license or the applicable additional terms
 ===============================================================================
 */
 
-static const int DELAY_DORMANT_TIME = 3000;
+static const int	DELAY_DORMANT_TIME = 3000;
+static const int	DEFAULT_SNAPSHOT_PRIORITY = 5; //COOP: All snapshotPriority values behind are top priority
+static const int	MAX_MISSING_SNAPSHOTS = 10; //COOP by stradex
+static const int	MAX_ENTITY_EVENTS_PER_SEC = 3; //MAX events an non-high priority entity can send per second
+static const float	FM_PROJECTILE_SPEED_MULTIPLIER = 1.25f;//Fast monsters projectiles speed multiplier for coop while using g_fastMonsters
+static const float	FM_SPEED_MULTIPLIER = 1.5f;// Fast monsters speed multiplier for coop while using g_fastMonsters (Basically changes the animation speed)
 
 extern const idEventDef EV_PostSpawn;
 extern const idEventDef EV_FindTargets;
@@ -68,6 +73,8 @@ extern const idEventDef EV_SetSkin;
 extern const idEventDef EV_StartSoundShader;
 extern const idEventDef EV_StopSound;
 extern const idEventDef EV_CacheSoundShader;
+// Nicemice: added
+extern const idEventDef EV_SetModel;
 
 // Think flags
 enum {
@@ -113,7 +120,6 @@ public:
 	idList<signal_t> signal[ NUM_SIGNALS ];
 };
 
-
 class idEntity : public idClass {
 public:
 	static const int		MAX_PVS_AREAS = 4;
@@ -121,8 +127,15 @@ public:
 	int						entityNumber;			// index into the entity list
 	int						entityDefNumber;		// index into the entity def list
 
+	int						entityCoopNumber;		// index into the entity coop list
+	int						entityTargetNumber;		// index into the entity coop list
+	int						entityRemoveSyncNumber; // index into the entity remove sync list
+
 	idLinkList<idEntity>	spawnNode;				// for being linked into spawnedEntities list
 	idLinkList<idEntity>	activeNode;				// for being linked into activeEntities list
+	idLinkList<idEntity>	coopNode;				// for being linked into coopSyncEntities list by Stradex for Coop
+	idLinkList<idEntity>	serverPriorityNode;		// for being linked into serverPriorityEntities list by Stradex for Coop netcode optimization
+	idLinkList<idEntity>	clientsideNode;			// for being linked into clientsideEntities list (added by Stradex)
 
 	idLinkList<idEntity>	snapshotNode;			// for being linked into snapshotEntities list
 	int						snapshotSequence;		// last snapshot this entity was in
@@ -135,13 +148,39 @@ public:
 	int						thinkFlags;				// TH_? flags
 	int						dormantStart;			// time that the entity was first closed off from player
 	bool					cinematic;				// during cinematics, entity will only think if cinematic is set
+	bool					allowClientsideThink;	// added for coop
+	bool					canBeCsTarget;			// added for coop
 
 	renderView_t *			renderView;				// for camera views from this entity
 	idEntity *				cameraTarget;			// any remoteRenderMap shaders will use this
 
 	idList< idEntityPtr<idEntity> >	targets;		// when this entity is activated these entities entity are activated
 
-	int						health;					// FIXME: do all objects really need health?
+	int						health;					// FIXME: do all objects really need health? STRADEX: wtf, really? why?
+
+	bool					spawnedByServer;		// When entity is spawned by the server, added by stradex for COOP
+	bool					clientSideEntity;		// FIXME: I think there's no need of this but well... for COOP
+	bool					firstTimeInClientPVS[MAX_CLIENTS]; //added for Netcode optimization for COOP (Stradex)
+	bool					forceNetworkSync;		//FIXME: I think there's no need of this. Just duct tape to fix the new netcode 
+	int						inSnapshotQueue[MAX_CLIENTS];		//IF there's a snapshot overflow (see net_serverSnapshotLimit) we're going to need a snapshotqueue
+	bool					inRemoteCameraPVS[MAX_CLIENTS];		//Netcode optimization for security cameras, if the entity it's in a remote camera pvs only, then it's lowest priority to sync in case of snapshot overflow)
+	bool					readByServer;			//if the entity was already tried to be sent in the snapshot
+	int						snapshotPriority;		//The priority of this entity (useful when snapshot overflow
+	int						snapshotMissingCount[MAX_CLIENTS];	//Missing snapshots count for coop
+	idVec3					lastSnapshotOrigin[MAX_CLIENTS]; // COOP: last origin position sended to a client via snapshot
+	bool					forceSnapshotUpdateOrigin;
+	bool					calledViaScriptThread; // Dirty hack for coop
+	bool					scriptAlreadyConstructed; //to fix a bug at localMapRestart
+	bool					findTargetsAlreadyCalled; //to fix a bug at localMapRestart
+	int						eventsSend;					//to debug
+	bool					eventSyncVital;				//if is vital that this entity always sync events
+	int						nextSendEventTime;			//next time to send event in case of overflow.
+	int						nextResetEventCountTime;
+	bool					allowRemoveSync;			// entity that can sync the remove state when a client joins the server to let know the client entities that do not exists anymore. 
+	int						csActivateTargetMaxDelay; //Maximum wait time to activate this target when receive the activate target even from server. (in seconds)
+
+	//From OpenCoop
+	bool					isMapEntity;			  // Nicemice: added
 
 	struct entityFlags_s {
 		bool				notarget			:1;	// if true never attack or target this entity
@@ -156,6 +195,8 @@ public:
 		bool				isDormant			:1;	// if true the entity is dormant
 		bool				hasAwakened			:1;	// before a monster has been awakened the first time, use full PVS for dormant instead of area-connected
 		bool				networkSync			:1; // if true the entity is synchronized over the network
+		bool				coopNetworkSync		:1; // if true the entity is synchronized over the network BUT SPECIFIC FOR COOP
+		bool				useOldNetcode		:1; // if true the entity use oldnetcode  SPECIFIC FOR COOP
 	} fl;
 
 public:
@@ -214,6 +255,10 @@ public:
 	const int *				GetPVSAreas( void );
 	void					ClearPVSAreas( void );
 	bool					PhysicsTeamInPVS( pvsHandle_t pvsHandle );
+	int						GetNumPVSAreas_snapshot(  int clientNum );
+	const int *				GetPVSAreas_snapshot(  int clientNum );
+	void					ClearPVSAreas_snapshot(  int clientNum );
+	bool					PhysicsTeamInPVS_snapshot( pvsHandle_t pvsHandle,  int clientNum ); //dirty code for coop optimization
 
 	// animation
 	virtual bool			UpdateAnimationControllers( void );
@@ -258,6 +303,15 @@ public:
 	bool					GetMasterPosition( idVec3 &masterOrigin, idMat3 &masterAxis ) const;
 	void					GetWorldVelocities( idVec3 &linearVelocity, idVec3 &angularVelocity ) const;
 
+	bool					IsMasterActive ( void ) const; //added for coop netcode
+	bool					IsMasterCoopSync ( void ) const; //added for coop netcode
+	bool					IsMasterInSnapshot ( void ) const; //added for coop netcode
+	bool					MasterUseOldNetcode ( void ) const; //added for coop netcode
+	bool					IsBoundToMover( void ) const; //added for coop netcode
+	void					Call_ConstructScriptObject( void ); //added by stradex to fix a bug at localMapRestart
+	void					Call_FindTargets( void ); //added by stradex to fix a bug at localMapRestart
+	void					SyncGuiParmInt(const int guiParmId, const int guiParmValue);
+
 	// physics
 							// set a new physics object to be used by this entity
 	void					SetPhysics( idPhysics *phys );
@@ -301,8 +355,8 @@ public:
 	// damage
 							// returns true if this entity can be damaged from the given origin
 	virtual bool			CanDamage( const idVec3 &origin, idVec3 &damagePoint ) const;
-							// applies damage to this entity
-	virtual	void			Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, const char *damageDefName, const float damageScale, const int location );
+							// applies damage to this entity (canBeClientDamage  added by Stradex for g_clientsideDamage 1)
+	virtual	void			Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, const char *damageDefName, const float damageScale, const int location, const bool canBeClientDamage = false );
 							// adds a damage effect like overlays, blood, sparks, debris etc.
 	virtual void			AddDamageEffect( const trace_t &collision, const idVec3 &velocity, const char *damageDefName );
 							// callback function for when another entity received damage from this entity.  damage can be adjusted and returned to the caller.
@@ -311,6 +365,9 @@ public:
 	virtual bool			Pain( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location );
 							// notifies this entity that is has been killed
 	virtual void			Killed( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location );
+
+	// applies damage to this entity (received by client)
+	virtual	void			ClientReceivedDamage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, int damage, const int location );
 
 	// scripting
 	virtual bool			ShouldConstructScriptObjectAtSpawn( void ) const;
@@ -331,17 +388,27 @@ public:
 	// targets
 	void					FindTargets( void );
 	void					RemoveNullTargets( void );
-	void					ActivateTargets( idEntity *activator ) const;
+	void					ActivateTargets( idEntity *activator ); //was const, changed for coop
+	void					CS_ActivateTargets(idEntity* activator, int timeActivated); //activate targets clientside
 
 	// misc
 	virtual void			Teleport( const idVec3 &origin, const idAngles &angles, idEntity *destination );
 	bool					TouchTriggers( void ) const;
+	bool					ClientTouchTriggers( void ) const; //added for Coop
+	void					SetCameraTarget(idEntity * cameraTargetEnt);
 	idCurve_Spline<idVec3> *GetSpline( void ) const;
 	virtual void			ShowEditingDialog( void );
 
 	enum {
 		EVENT_STARTSOUNDSHADER,
 		EVENT_STOPSOUNDSHADER,
+		EVENT_ACTIVATE_TARGETS, //added by Stradex for coop
+		EVENT_SETNETSHADERPARM, //added by Stradex for coop
+		EVENT_SETKEYVAL, //added by Stradex for coop
+		EVENT_SETMODEL, //nicemice added (OpenCoop)
+		EVENT_CLIENTDAMAGE, //added by Stradex for g_clientsideDamage 1
+		EVENT_CAMTARGETUPDATE, //added by Stradex
+		EVENT_SYNCGUIPARM, //added by Stradex for coop
 		EVENT_MAXEVENTS
 	};
 
@@ -358,8 +425,14 @@ public:
 	void					WriteGUIToSnapshot( idBitMsgDelta &msg ) const;
 	void					ReadGUIFromSnapshot( const idBitMsgDelta &msg );
 
-	void					ServerSendEvent( int eventId, const idBitMsg *msg, bool saveEvent, int excludeClient ) const;
+	void					ServerSendEvent( int eventId, const idBitMsg *msg, bool saveEvent, int excludeClient , bool saveLastOnly=false); //COOP: was const
 	void					ClientSendEvent( int eventId, const idBitMsg *msg ) const;
+
+	//OpenCoop nicemice
+	void					WriteHiddenToSnapshot(idBitMsgDelta& msg) const;
+	void					ReadHiddenFromSnapshot(const idBitMsgDelta& msg);
+
+	void					ForceClientsideEntityHack(void);	//Ugly hack to force an entity to be clientside after being spawned!
 
 protected:
 	renderEntity_t			renderEntity;						// used to present a model to the renderer
@@ -377,6 +450,9 @@ private:
 
 	int						numPVSAreas;						// number of renderer areas the entity covers
 	int						PVSAreas[MAX_PVS_AREAS];			// numbers of the renderer areas the entity covers
+
+	int						numPVSAreas_snapshot[MAX_CLIENTS];				// COOP: number of renderer areas the entity covers
+	int						PVSAreas_snapshot[MAX_CLIENTS][MAX_PVS_AREAS];	// COOP: numbers of the renderer areas the entity covers
 
 	signalList_t *			signals;
 
@@ -400,6 +476,7 @@ private:
 	void					QuitTeam( void );					// leave the current team
 
 	void					UpdatePVSAreas( void );
+	void					UpdatePVSAreas_snapshot( int clientNum );
 
 	// events
 	void					Event_GetName( void );
@@ -465,6 +542,13 @@ private:
 	void					Event_HasFunction( const char *name );
 	void					Event_CallFunction( const char *name );
 	void					Event_SetNeverDormant( int enable );
+
+	// COOP
+	void					Event_SafeRemove(void);  //added for coop 
+	void					Event_SetNetShaderParm( int parmnum, float value ); //added for OpenCoop Compatibility
+	void					Event_StartNetSoundShader( const char *soundName, int channel, int netSync ); //added for OpenCoop Compatibility
+	bool					IsAllowedToSendDeleteEvent( void );
+	bool					IsAllowedToBecomeInactive( void ); 
 };
 
 /*

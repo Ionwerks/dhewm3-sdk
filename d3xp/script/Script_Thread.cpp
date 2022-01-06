@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "sys/platform.h"
 
+#include "framework/async/NetworkSystem.h" //Coop
 #include "gamesys/SysCvar.h"
 #include "Player.h"
 #include "Camera.h"
@@ -124,6 +125,13 @@ const idEventDef EV_Thread_DebugCircle( "debugCircle", "vvvfdf" );
 const idEventDef EV_Thread_DebugBounds( "debugBounds", "vvvf" );
 const idEventDef EV_Thread_DrawText( "drawText", "svfvdf" );
 const idEventDef EV_Thread_InfluenceActive( "influenceActive", NULL, 'd' );
+const idEventDef EV_Thread_GetSkill( "getSkill", NULL, 'd' ); //added for OpenCoop maps support
+const idEventDef EV_Thread_NumPlayers( "numPlayers", NULL, 'd' ); //added for OpenCoop maps support
+const idEventDef EV_Thread_GetClosestPlayer( "getClosestPlayer", "v", 'e' ); //added for OpenCoop maps support
+const idEventDef EV_Thread_KillEntities( "killEntities", "ss"); //added for OpenCoop maps support
+#ifdef _D3XP
+const idEventDef EV_Thread_GiveItemToPlayers( "giveItemToPlayers", "s"); //to fix powercells in d3xp
+#endif
 
 CLASS_DECLARATION( idClass, idThread )
 	EVENT( EV_Thread_Execute,				idThread::Event_Execute )
@@ -215,6 +223,13 @@ CLASS_DECLARATION( idClass, idThread )
 	EVENT( EV_Thread_DebugBounds,			idThread::Event_DebugBounds )
 	EVENT( EV_Thread_DrawText,				idThread::Event_DrawText )
 	EVENT( EV_Thread_InfluenceActive,		idThread::Event_InfluenceActive )
+	EVENT( EV_Thread_GetSkill,				idThread::Event_GetSkill )
+	EVENT( EV_Thread_NumPlayers,			idThread::Event_NumPlayers )
+	EVENT( EV_Thread_GetClosestPlayer,		idThread::Event_GetClosestPlayer )
+	EVENT( EV_Thread_KillEntities,			idThread::Event_KillEntities )
+#ifdef _D3XP
+	EVENT( EV_Thread_GiveItemToPlayers,		idThread::Event_GiveItemToPlayers )
+#endif
 END_CLASS
 
 idThread			*idThread::currentThread = NULL;
@@ -1057,7 +1072,13 @@ idThread::Event_Trigger
 void idThread::Event_Trigger( idEntity *ent ) {
 	if ( ent ) {
 		ent->Signal( SIG_TRIGGER );
-		ent->ProcessEvent( &EV_Activate, gameLocal.GetLocalPlayer() );
+		//little hack for coop
+		ent->calledViaScriptThread = true;
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer && !gameLocal.GetLocalPlayer()) {
+			ent->ProcessEvent( &EV_Activate, gameLocal.GetCoopPlayer() ); //little hack for coop
+		} else {
+			ent->ProcessEvent( &EV_Activate, gameLocal.GetLocalPlayer() );
+		}
 		ent->TriggerGuis();
 	}
 }
@@ -1478,6 +1499,10 @@ void idThread::Event_SetCamera( idEntity *ent ) {
 		return;
 	}
 
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return;
+	}
+
 	if ( !ent->IsType( idCamera::Type ) ) {
 		Error( "Entity is not a camera" );
 		return;
@@ -1605,8 +1630,29 @@ idThread::Event_FadeIn
 ================
 */
 void idThread::Event_FadeIn( idVec3 &color, float time ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return;
+	}
+
 	idVec4		fadeColor;
 	idPlayer	*player;
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		idBitMsg	outMsg;
+		byte		msgBuf[MAX_GAME_MESSAGE_SIZE];
+		outMsg.Init(msgBuf, sizeof(msgBuf));
+		outMsg.BeginWriting();
+		outMsg.WriteByte(GAME_RELIABLE_MESSAGE_FADE);
+		outMsg.WriteFloat(color[0]);
+		outMsg.WriteFloat(color[1]);
+		outMsg.WriteFloat(color[2]);
+		outMsg.WriteFloat(0.0f);
+		outMsg.WriteFloat(time);
+		networkSystem->ServerSendReliableMessage(-1, outMsg);
+
+		common->Printf("[COOP] Sending fade...\n");
+	}
 
 	player = gameLocal.GetLocalPlayer();
 	if ( player ) {
@@ -1621,8 +1667,29 @@ idThread::Event_FadeOut
 ================
 */
 void idThread::Event_FadeOut( idVec3 &color, float time ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return;
+	}
+
 	idVec4		fadeColor;
 	idPlayer	*player;
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		idBitMsg	outMsg;
+		byte		msgBuf[MAX_GAME_MESSAGE_SIZE];
+		outMsg.Init(msgBuf, sizeof(msgBuf));
+		outMsg.BeginWriting();
+		outMsg.WriteByte(GAME_RELIABLE_MESSAGE_FADE);
+		outMsg.WriteFloat(color[0]);
+		outMsg.WriteFloat(color[1]);
+		outMsg.WriteFloat(color[2]);
+		outMsg.WriteFloat(1.0f);
+		outMsg.WriteFloat(time);
+		networkSystem->ServerSendReliableMessage(-1, outMsg);
+
+		common->Printf("[COOP] Sending fade...\n");
+	}
 
 	player = gameLocal.GetLocalPlayer();
 	if ( player ) {
@@ -1637,8 +1704,29 @@ idThread::Event_FadeTo
 ================
 */
 void idThread::Event_FadeTo( idVec3 &color, float alpha, float time ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return;
+	}
+
 	idVec4		fadeColor;
 	idPlayer	*player;
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		idBitMsg	outMsg;
+		byte		msgBuf[MAX_GAME_MESSAGE_SIZE];
+		outMsg.Init(msgBuf, sizeof(msgBuf));
+		outMsg.BeginWriting();
+		outMsg.WriteByte(GAME_RELIABLE_MESSAGE_FADE);
+		outMsg.WriteFloat(color[0]);
+		outMsg.WriteFloat(color[1]);
+		outMsg.WriteFloat(color[2]);
+		outMsg.WriteFloat(alpha);
+		outMsg.WriteFloat(time);
+		networkSystem->ServerSendReliableMessage(-1, outMsg);
+
+		common->Printf("[COOP] Sending fade...\n");
+	}
 
 	player = gameLocal.GetLocalPlayer();
 	if ( player ) {
@@ -1921,3 +2009,109 @@ void idThread::Event_InfluenceActive( void ) {
 		idThread::ReturnInt( false );
 	}
 }
+
+/*
+================
+idThread::Event_GetSkill
+================
+*/
+void idThread::Event_GetSkill( void )
+{
+	int gSkill = gameLocal.isMultiplayer ? gameLocal.serverInfo.GetInt("g_skill")  : g_skill.GetInteger();
+
+	idThread::ReturnInt( gSkill );
+
+}
+
+/*
+================
+idThread::Event_NumPlayers
+================
+*/
+
+void idThread::Event_NumPlayers( void )
+{
+	int playersPlaying=0;
+	for (int i=0; i < gameLocal.numClients; i++) {
+		idPlayer *client = gameLocal.GetClientByNum(i);
+
+		if (!client || client->spectating) {
+			continue;
+		}
+
+		playersPlaying++;
+	}
+
+	idThread::ReturnInt( playersPlaying );
+}
+
+/*
+================
+idThread::Event_GetClosestPlayer
+================
+*/
+
+void idThread::Event_GetClosestPlayer(const idVec3 &pos )
+{
+	idPlayer* closestPlayer = NULL;
+	float shortestDist = idMath::INFINITY;
+	idPlayer *player;
+	float dist;
+	idVec3	delta;
+	for (int i = 0; i < gameLocal.numClients; i++) {
+		player = gameLocal.GetClientByNum(i);
+
+		if (!player || player->spectating || player->health <= 0) {
+			continue;
+		}
+
+		delta = pos - player->GetPhysics()->GetOrigin();
+		dist = delta.LengthSqr();
+
+		if (dist < shortestDist) {
+			shortestDist = dist;
+			closestPlayer = player;
+		}
+	}
+
+	idThread::ReturnEntity( closestPlayer );
+}
+
+/*
+================
+idThread::Event_GetClosestPlayer
+================
+*/
+
+void idThread::Event_KillEntities( const char *key, const char *value )
+{
+	//EMPTY BY NOW. FIXME Stradex
+} 
+
+#ifdef _D3XP
+/*
+================
+idThread::Event_GiveItemToPlayers
+================
+*/
+
+void idThread::Event_GiveItemToPlayers(  const char *itemName )
+{
+	if (gameLocal.isClient) { //clients cannot reach this part
+		return;
+	}
+
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "say Giving item: %s to all players!\n", itemName ) );
+
+	idPlayer *player;
+	for (int i = 0; i < gameLocal.numClients; i++) {
+		player = gameLocal.GetClientByNum(i);
+
+		if (!player || player->spectating || player->health <= 0) {
+			continue;
+		}
+		player->GiveInventoryItem(itemName);
+	}
+}
+
+#endif

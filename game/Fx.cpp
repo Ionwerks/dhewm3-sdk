@@ -557,7 +557,9 @@ idEntityFx::idEntityFx() {
 	fxEffect = NULL;
 	started = -1;
 	nextTriggerTime = -1;
-	fl.networkSync = true;
+	fl.networkSync = true; 
+	fl.coopNetworkSync = true; //coop: Should this really be a networksync entity?
+	snapshotPriority = 6; //coop: really low priority (in case of snapshot overflow)
 }
 
 /*
@@ -690,14 +692,14 @@ idEntityFx::StartFx
 */
 idEntityFx *idEntityFx::StartFx( const char *fx, const idVec3 *useOrigin, const idMat3 *useAxis, idEntity *ent, bool bind ) {
 
-	if ( g_skipFX.GetBool() || !fx || !*fx ) {
+	if ( g_skipFX.GetBool() || !fx || !*fx || (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient)) { //FIXME: this point should never be reached in Multiplayer at all by clients
 		return NULL;
 	}
 
 	idDict args;
 	args.SetBool( "start", true );
 	args.Set( "fx", fx );
-	idEntityFx *nfx = static_cast<idEntityFx *>( gameLocal.SpawnEntityType( idEntityFx::Type, &args ) );
+	idEntityFx *nfx = static_cast<idEntityFx *>( gameLocal.SpawnEntityType( idEntityFx::Type, &args ) ); //crash reason
 	if ( nfx->Joint() && *nfx->Joint() ) {
 		nfx->BindToJoint( ent, nfx->Joint(), true );
 		nfx->SetOrigin( vec3_origin );
@@ -748,9 +750,23 @@ void idEntityFx::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 			started = 0;
 			return;
 		}
-		const idDeclFX *fx = static_cast<const idDeclFX *>( declManager->DeclByIndex( DECL_FX, fx_index ) );
+		const idDeclFX *fx;
+		//ugly avoid crash in coop
+
+		int declTypeCount = declManager->GetNumDecls(DECL_ENTITYDEF);
+		if (fx_index < 0 || fx_index >= declTypeCount) {
+			fx = NULL;
+		} else {
+			fx = static_cast<const idDeclFX *>( declManager->DeclByIndex( DECL_FX, fx_index ) );
+		}
+
+		//end avoid crash in coop
 		if ( !fx ) {
-			gameLocal.Error( "FX at index %d not found", fx_index );
+			if (gameLocal.mpGame.IsGametypeCoopBased()) {
+				common->Warning("[COOP] FX at index %d not found", fx_index);
+			} else {
+				gameLocal.Error( "FX at index %d not found", fx_index );
+			}
 		}
 		fxEffect = fx;
 		Setup( fx->GetName() );
@@ -789,6 +805,18 @@ idTeleporter::Event_DoAction
 ================
 */
 void idTeleporter::Event_DoAction( idEntity *activator ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && !activator) { 
+		activator = gameLocal.GetCoopPlayer();
+	}
+	if (!activator) {
+		return;
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer && activator->IsType(idPlayer::Type)) { //create a new global checkpoint at this position for Coop
+		gameLocal.mpGame.CreateNewCheckpoint(GetPhysics()->GetOrigin());
+	}
+
 	idAngles a( 0, spawnArgs.GetFloat( "angle" ), 0 );
 	activator->Teleport( GetPhysics()->GetOrigin(), a, NULL );
 }

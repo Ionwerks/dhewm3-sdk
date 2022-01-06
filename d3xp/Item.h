@@ -56,6 +56,8 @@ public:
 	virtual bool			Pickup( idPlayer *player );
 	virtual void			Think( void );
 	virtual void			Present();
+	//SPECIFIC COOP STUFF
+	virtual bool			CS_GiveToPlayer( idPlayer *player ); //Client-side give to player
 
 	enum {
 		EVENT_PICKUP = idEntity::EVENT_MAXEVENTS,
@@ -82,6 +84,10 @@ private:
 	bool					spin;
 	bool					pulse;
 	bool					canPickUp;
+
+	//specific coop stuff
+	bool					clientPickedItem[MAX_CLIENTS]; //added by Stradex for when si_onePickupPerPlayer is enabled
+	bool					firstTimePicked; //to avoid activate targets multiple times
 
 	// for item pulse effect
 	int						itemShellHandle;
@@ -131,9 +137,16 @@ public:
 
 	void					Spawn();
 
+	enum {
+		EVENT_TRIGGER = idItem::EVENT_MAXEVENTS
+	};
+
+	virtual bool			ClientReceiveEvent( int event, int time, const idBitMsg &msg );
+
 private:
 	idVec3					playerPos;
 
+	void					CS_Event_Trigger( idEntity *activator );
 	void					Event_Trigger( idEntity *activator );
 	void					Event_HideObjective( idEntity *e );
 	void					Event_GetPlayerPos();
@@ -146,6 +159,7 @@ public:
 
 	void					Spawn();
 	virtual bool			GiveToPlayer( idPlayer *player );
+	virtual bool			CS_GiveToPlayer( idPlayer *player ); //Client-side give to player
 };
 
 class idPDAItem : public idItem {
@@ -153,6 +167,7 @@ public:
 	CLASS_PROTOTYPE( idPDAItem );
 
 	virtual bool			GiveToPlayer( idPlayer *player );
+	virtual bool			CS_GiveToPlayer( idPlayer *player ); //Client-side give to player
 };
 
 class idMoveableItem : public idItem {
@@ -273,6 +288,7 @@ public:
 	CLASS_PROTOTYPE( idMoveablePDAItem );
 
 	virtual bool			GiveToPlayer( idPlayer *player );
+	virtual bool			CS_GiveToPlayer( idPlayer *player ); //Client-side give to player
 };
 
 /*
@@ -305,9 +321,16 @@ public:
 
 	void					Spawn();
 
+	enum {
+		EVENT_TRIGGER = idEntity::EVENT_MAXEVENTS
+	};
+
+	virtual bool			ClientReceiveEvent( int event, int time, const idBitMsg &msg );
+
 private:
 	idVec3					playerPos;
 
+	void					CS_Event_Trigger( idEntity *activator );
 	void					Event_Trigger( idEntity *activator );
 	void					Event_HideObjective( idEntity *e );
 	void					Event_GetPlayerPos();

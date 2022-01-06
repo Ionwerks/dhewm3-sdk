@@ -343,8 +343,10 @@ void idGrabber::StopDrag( bool dropOnly ) {
 
 			if ( grabbableAI( ent->spawnArgs.GetString( "classname" ) ) ) {
 				idAI *aiEnt = static_cast<idAI*>(ent);
-
-				aiEnt->Damage( thePlayer, thePlayer, vec3_origin, "damage_suicide", 1.0f, INVALID_JOINT );
+				if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && thePlayer->entityNumber == gameLocal.localClientNum) {
+					aiEnt->killedByGrabber = true; //added for coop
+				}
+				aiEnt->Damage( thePlayer, thePlayer, vec3_origin, "damage_suicide", 1.0f, INVALID_JOINT , true);
 			}
 
 			af->SetThrown( !dropOnly );
@@ -384,6 +386,16 @@ void idGrabber::StopDrag( bool dropOnly ) {
 				// Restore projectile contents
 				ent->GetPhysics()->SetContents( savedContents );
 				ent->GetPhysics()->SetClipMask( savedClipmask );
+
+				//added for LM
+				idProjectile *projectile = static_cast< idProjectile* >( ent );
+				if ( projectile != NULL ) {
+					projectile->SetLaunchedFromGrabber( true );
+					if (gameLocal.mpGame.IsGametypeCoopBased() && g_clientsideDamage.GetBool() && !projectile->clientsideNode.InList()) {
+						projectile->selfClientside = false;
+					}
+				}
+				//end for LM
 
 			} else if ( ent->IsType( idMoveable::Type ) ) {
 				// Turn on damage for this object

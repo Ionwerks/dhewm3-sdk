@@ -26,6 +26,26 @@ If you have questions concerning this license or the applicable additional terms
 ===========================================================================
 */
 
+/*
+===========================================================================
+Doom 3 BFG Edition GPL Source Code
+Copyright (C) 1993-2012 id Software LLC, a ZeniMax Media company.
+This file is part of the Doom 3 BFG Edition GPL Source Code ("Doom 3 BFG Edition Source Code").
+Doom 3 BFG Edition Source Code is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+Doom 3 BFG Edition Source Code is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+You should have received a copy of the GNU General Public License
+along with Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
+In addition, the Doom 3 BFG Edition Source Code is also subject to certain additional terms. You should have received a copy of these additional terms immediately following the terms and conditions of the GNU General Public License which accompanied the Doom 3 BFG Edition Source Code.  If not, please request a copy in writing from id Software at the address below.
+If you have questions concerning this license or the applicable additional terms, you may contact in writing id Software LLC, c/o ZeniMax Media Inc., Suite 120, Rockville, Maryland 20850 USA.
+===========================================================================
+*/
+
 #ifndef __GAME_PLAYER_H__
 #define __GAME_PLAYER_H__
 
@@ -57,6 +77,8 @@ extern const idEventDef EV_Player_DisableWeapon;
 extern const idEventDef EV_Player_ExitTeleporter;
 extern const idEventDef EV_Player_SelectWeapon;
 extern const idEventDef EV_SpectatorTouch;
+extern const idEventDef EV_Player_EnableFallDamage;			//Added for coop
+extern const idEventDef EV_Player_EnableReadClientPhysics;	//Added for coop
 
 const float THIRD_PERSON_FOCUS_DISTANCE	= 512.0f;
 const int	LAND_DEFLECT_TIME = 150;
@@ -170,6 +192,7 @@ public:
 	void					Restore( idRestoreGame *savefile );					// unarchives object from save game file
 
 	void					Clear( void );
+	void					CoopClear( void ); //To keep pda security, keys, etc... (and all related to inv_carry)
 	void					GivePowerUp( idPlayer *player, int powerup, int msec );
 	void					ClearPowerUps( void );
 	void					GetPersistantData( idDict &dict );
@@ -188,6 +211,13 @@ public:
 	int						HasAmmo( const char *weapon_classname );			// looks up the ammo information for the weapon class first
 
 	void					UpdateArmor( void );
+
+	//COOP specific functions
+	bool					CS_Give( idPlayer *owner, const idDict &spawnArgs, const char *statname, const char *value, int *idealWeapon, bool updateHud );
+	void					CS_GetPersistantData( idDict &dict );
+	void					CS_RestoreInventory( idPlayer *owner, const idDict &dict );
+	void					CS_CoopClear( void ); //To keep pda security, keys, etc... (and all related to inv_carry)
+	void					GiveSpawnItemsToPlayer( idPlayer *owner, const idDict &dict); //coop specific
 
 	int						nextItemPickup;
 	int						nextItemNum;
@@ -214,6 +244,10 @@ public:
 		EVENT_ABORT_TELEPORTER,
 		EVENT_POWERUP,
 		EVENT_SPECTATE,
+		EVENT_PLAYERPHYSICS, //addded by stradex
+		EVENT_PLAYERSPAWN, //addded by stradex
+		EVENT_PLAYERTELEPORT,  //addded by stradex
+		EVENT_SENDDAMAGE, //addded by stradex
 		EVENT_MAXEVENTS
 	};
 
@@ -326,6 +360,7 @@ public:
 	idMat3					firstPersonViewAxis;
 
 	idDragEntity			dragEntity;
+	bool					spawnPhaseWalk;
 
 public:
 	CLASS_PROTOTYPE( idPlayer );
@@ -381,10 +416,11 @@ public:
 	virtual void			DamageFeedback( idEntity *victim, idEntity *inflictor, int &damage );
 	void					CalcDamagePoints(  idEntity *inflictor, idEntity *attacker, const idDict *damageDef,
 							   const float damageScale, const int location, int *health, int *armor );
-	virtual	void			Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, const char *damageDefName, const float damageScale, const int location );
+	virtual	void			Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, const char *damageDefName, const float damageScale, const int location, const bool canBeClientDamage = false );
 
 							// use exitEntityNum to specify a teleport with private camera view and delayed exit
 	virtual void			Teleport( const idVec3 &origin, const idAngles &angles, idEntity *destination );
+	virtual void			Teleport( const idVec3 &origin, const idAngles &angles ); //For coop only
 
 	void					Kill( bool delayRespawn, bool nodamage );
 	virtual void			Killed( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location );
@@ -416,7 +452,7 @@ public:
 	void					RemoveInventoryItem( const char *name );
 	idDict *				FindInventoryItem( const char *name );
 
-	void					GivePDA( const char *pdaName, idDict *item );
+	void					GivePDA( const char *pdaName, idDict *item);
 	void					GiveVideo( const char *videoName, idDict *item );
 	void					GiveEmail( const char *emailName );
 	void					GiveSecurity( const char *security );
@@ -524,6 +560,38 @@ public:
 	bool					SelfSmooth( void );
 	void					SetSelfSmooth( bool b );
 
+	//COOP SPECIFIC
+	idDict					originalSpawnArgs;	//used for coop inventory
+	bool					allowClientsideMovement; //used to let the server send info for some seconds after spawning, to avoid spawn in void
+	int						nextSendPhysicsInfoTime; // COOP: added for clientside movement code 
+	int						nextTimeCoopTeleported; //Hack for opencoop maps
+	int						nextTimeReadHealth; //for g_clientsideDamage 1
+	int						nextTimeSendDamage; //for g_clientsideDamage 1
+	bool					noFallDamage;		//ductape fix for coop while using teleport with net_clientsideMovement 1
+	bool					clientTeleported;	//for net_clientsideMovement 1
+	bool					clientSpawnedByServer;	//Used with allowClientsideMovement to determine if an entity can have clientside Movement or not
+	bool					serverReadPlayerPhysics; //Used with allowClientsideMovement to determine if an entity can have clientside Movement or not
+	bool					firstTimeSpawnedInMap; //Used first time spawned in map
+
+	idAngles				GetViewAngles(void); //added for coop checkpoint teleport
+	bool					IsCollidingWithPlayer();
+	idAI*					GetFocusCharacter(void);
+
+	//Client-side stuff for coop
+	bool					CS_Give( const char *statname, const char *value );
+	bool					CS_GiveItem( idItem *item );
+	void					CS_GivePDA( const char *pdaName, idDict *item );
+	void					CS_GiveVideo( const char *videoName, idDict *item );
+	void					CS_GiveEmail( const char *emailName );
+	void					CS_GiveSecurity( const char *security );
+	void					CS_GiveObjective( const char *title, const char *text, const char *screenshot );
+	void					CS_CompleteObjective( const char *title );
+	void					CS_SavePersistantInfo( void );
+	void					CS_RestorePersistantInfo( void );
+	bool					CanHaveClientsideMovement(void);
+
+	//END COOP SPECIFIC
+
 private:
 	jointHandle_t			hipJoint;
 	jointHandle_t			chestJoint;
@@ -556,6 +624,8 @@ private:
 	bool					weaponEnabled;
 	bool					showWeaponViewModel;
 
+	bool					forceSPSpawnPoint;  // COOP
+
 	const idDeclSkin *		skin;
 	const idDeclSkin *		powerUpSkin;
 	idStr					baseSkinName;
@@ -566,6 +636,7 @@ private:
 	bool					airless;
 	int						airTics;				// set to pm_airTics at start, drops in vacuum
 	int						lastAirDamage;
+	int						playerDamageReceived;	//for g_clientsideDamage 1
 
 	bool					gibDeath;
 	bool					gibsLaunched;
@@ -632,6 +703,7 @@ private:
 	int						MPAimFadeTime;			// for GUI fade
 	bool					MPAimHighlight;
 	bool					isTelefragged;			// proper obituaries
+	int						serverOverridePositionTime; //added for Doom 3 BFG Edition clientside movement
 
 	idPlayerIcon			playerIcon;
 
@@ -695,6 +767,15 @@ private:
 	void					Event_LevelTrigger( void );
 	void					Event_Gibbed( void );
 	void					Event_GetIdealWeapon( void );
+	void					Event_EnableFallDamage(void);
+	void					Event_EnableReadClientPhysics(void);
+
+
+	//Coop start:
+	void					Event_GetLinearVelocity(void); //for sentry bot coop hack
+	bool					IsPhysicsFrameClientside(void); //added for net_clientsideMovement 1
+	void					DisableClientsideMovement(int timeMsec); //time in msecs to disable clientside movement
+	void					ClientsideMovementThink( void );
 };
 
 ID_INLINE bool idPlayer::IsReady( void ) {

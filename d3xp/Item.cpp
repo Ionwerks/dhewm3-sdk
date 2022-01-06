@@ -75,7 +75,15 @@ idItem::idItem() {
 	shellMaterial = NULL;
 	orgOrigin.Zero();
 	canPickUp = true;
+	//Commented for coop
 	fl.networkSync = true;
+	fl.coopNetworkSync = false; //don't sync items in coop
+
+	//coop
+	for (int i=0; i < MAX_CLIENTS; i++) {
+		clientPickedItem[i] = false;
+	}
+	firstTimePicked = true;
 }
 
 /*
@@ -303,12 +311,12 @@ void idItem::Spawn( void ) {
 
 #ifdef CTF
 	// idItemTeam does not rotate and bob
-	if ( spawnArgs.GetBool( "spin" ) || (gameLocal.isMultiplayer && !this->IsType( idItemTeam::Type ) ) ) {
+	if ( spawnArgs.GetBool( "spin" ) || (gameLocal.isMultiplayer && !this->IsType( idItemTeam::Type ) && !gameLocal.mpGame.IsGametypeCoopBased()) ) {
 		spin = true;
 		BecomeActive( TH_THINK );
 	}
 #else
-	if ( spawnArgs.GetBool( "spin" ) || gameLocal.isMultiplayer ) {
+	if ( spawnArgs.GetBool( "spin" ) || (gameLocal.isMultiplayer && !gameLocal.mpGame.IsGametypeCoopBased())) {
 		spin = true;
 		BecomeActive( TH_THINK );
 	}
@@ -353,12 +361,62 @@ bool idItem::GiveToPlayer( idPlayer *player ) {
 	if ( player == NULL ) {
 		return false;
 	}
+	if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) { //how the fuck this point is reached?
+		return false;
+	}
+
+	if ( spawnArgs.GetBool( "inv_carry" ) ) {
+
+		if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()) {
+			if (idStr::FindText(this->GetEntityDefName(), "item_key", false) >= 0) { //HACK: Key items
+
+				gameLocal.SaveGlobalInventory(&spawnArgs);
+
+				cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "say '%s^0' picked up Key: %s!\n", gameLocal.userInfo[ player->entityNumber ].GetString( "ui_name" ), spawnArgs.GetString( "inv_name" ) ) );
+				for (int i=0; i < gameLocal.numClients; i++) {
+					idPlayer* p = gameLocal.GetClientByNum(i);
+
+					if (p && (p->entityNumber != player->entityNumber)) {
+						p->GiveInventoryItem( &spawnArgs ); //giving key to all players
+					}
+				}
+			} else if (idStr::FindText(this->GetEntityDefName(), "item_powercell", false) >= 0) {
+
+				gameLocal.SaveGlobalInventory(&spawnArgs);
+
+				cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "say '%s^0' picked up Powercell: %s!\n", gameLocal.userInfo[ player->entityNumber ].GetString( "ui_name" ), spawnArgs.GetString( "inv_name" ) ) );
+				for (int i=0; i < gameLocal.numClients; i++) {
+					idPlayer* p = gameLocal.GetClientByNum(i);
+
+					if (p && (p->entityNumber != player->entityNumber)) {
+						p->GiveInventoryItem( &spawnArgs ); //giving key to all players
+					}
+				}
+			}
+		}
+
+		return player->GiveInventoryItem( &spawnArgs );
+	}
+
+	return player->GiveItem( this );
+}
+
+/*
+================
+idItem::CS_GiveToPlayer
+ADDED  for coop
+================
+*/
+bool idItem::CS_GiveToPlayer( idPlayer *player ) {
+	if ( player == NULL ) {
+		return false;
+	}
 
 	if ( spawnArgs.GetBool( "inv_carry" ) ) {
 		return player->GiveInventoryItem( &spawnArgs );
 	}
 
-	return player->GiveItem( this );
+	return player->CS_GiveItem( this );
 }
 
 /*
@@ -368,11 +426,62 @@ idItem::Pickup
 */
 bool idItem::Pickup( idPlayer *player ) {
 
+	float respawn = spawnArgs.GetFloat( "respawn" );
+	bool dropped = spawnArgs.GetBool( "dropped" );
+	bool no_respawn = spawnArgs.GetBool( "no_respawn" );
+
+	if ((!gameLocal.mpGame.IsGametypeCoopBased() || gameLocal.serverInfo.GetBool("si_itemRespawn")) && gameLocal.isMultiplayer && respawn == 0.0f ) {
+		respawn = 20.0f;
+	}
+
+	if ( gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased() ) { //client-side pickup for coop
+
+		if (player && gameLocal.serverInfo.GetBool("si_onePickupPerPlayer") && (player->entityNumber != gameLocal.localClientNum)) { //One Pickup per player clientside behaviour
+			return false;
+		}
+
+		if ( !CS_GiveToPlayer( player ) ) {
+			return false;
+		}
+
+		StartSound( "snd_acquire", SND_CHANNEL_ITEM, 0, false, NULL );
+
+		// clear our contents so the object isn't picked up twice
+		GetPhysics()->SetContents( 0 );
+
+		// hide the model
+		Hide();
+		// add the highlight shell
+		if ( itemShellHandle != -1 ) {
+			gameRenderWorld->FreeEntityDef( itemShellHandle );
+			itemShellHandle = -1;
+		}
+
+		if ( respawn && !dropped && !no_respawn ) {
+			//common->Printf("Item should respawn in %f seconds\n", respawn);
+			const char *sfx = spawnArgs.GetString( "fxRespawn" );
+			//if ( sfx && *sfx ) {
+			//	PostEventSec( &EV_RespawnFx, respawn - 0.5f );
+			//}
+			CS_PostEventSec( &EV_RespawnItem, respawn );
+		}
+		BecomeInactive( TH_THINK );
+		return true;
+	}
+
+	//server-side - Singleplayer pickup
+
+	if (player &&  gameLocal.serverInfo.GetBool("si_onePickupPerPlayer") && clientPickedItem[player->entityNumber]) { //COOP
+		return false; //this player already picked this item
+	}
+
 	if ( !GiveToPlayer( player ) ) {
 		return false;
 	}
 
-	if ( gameLocal.isServer ) {
+	clientPickedItem[player->entityNumber] = true;
+
+	if ( gameLocal.isServer && !gameLocal.mpGame.IsGametypeCoopBased() ) { //not sending events in coop
 		ServerSendEvent( EVENT_PICKUP, NULL, false, -1 );
 	}
 
@@ -380,10 +489,20 @@ bool idItem::Pickup( idPlayer *player ) {
 	StartSound( "snd_acquire", SND_CHANNEL_ITEM, 0, false, NULL );
 
 	// trigger our targets
-	ActivateTargets( player );
+	if (firstTimePicked || !gameLocal.serverInfo.GetBool("si_onePickupPerPlayer") || !gameLocal.mpGame.IsGametypeCoopBased()) {
+		firstTimePicked = false; //COOP: used only when si_onePickupPerPlayer enabled
+		ActivateTargets( player );
+	}
 
 	// clear our contents so the object isn't picked up twice
-	GetPhysics()->SetContents( 0 );
+	if (!gameLocal.serverInfo.GetBool("si_onePickupPerPlayer") || !gameLocal.mpGame.IsGametypeCoopBased()) { //COOP: enable multiple pickups with si_onePickupPerPlayer enabled
+		// clear our contents so the object isn't picked up twice
+		GetPhysics()->SetContents( 0 );
+	}
+
+	//COOP: if si_onePickupPerPlayer enabled, then only hide the model when the local player pick it.
+	if (!gameLocal.serverInfo.GetBool("si_onePickupPerPlayer") || (player->entityNumber == gameLocal.localClientNum) || !gameLocal.mpGame.IsGametypeCoopBased()) 
+	{
 
 	// hide the model
 	Hide();
@@ -392,14 +511,6 @@ bool idItem::Pickup( idPlayer *player ) {
 	if ( itemShellHandle != -1 ) {
 		gameRenderWorld->FreeEntityDef( itemShellHandle );
 		itemShellHandle = -1;
-	}
-
-	float respawn = spawnArgs.GetFloat( "respawn" );
-	bool dropped = spawnArgs.GetBool( "dropped" );
-	bool no_respawn = spawnArgs.GetBool( "no_respawn" );
-
-	if ( gameLocal.isMultiplayer && respawn == 0.0f ) {
-		respawn = 20.0f;
 	}
 
 	if ( respawn && !dropped && !no_respawn ) {
@@ -411,13 +522,19 @@ bool idItem::Pickup( idPlayer *player ) {
 	} else if ( !spawnArgs.GetBool( "inv_objective" ) && !no_respawn ) {
 		// give some time for the pickup sound to play
 		// FIXME: Play on the owner
-		if ( !spawnArgs.GetBool( "inv_carry" ) ) {
+		if ( !spawnArgs.GetBool( "inv_carry" ) && (!gameLocal.serverInfo.GetBool("si_onePickupPerPlayer") || !gameLocal.mpGame.IsGametypeCoopBased()) ) {
 			PostEventMS( &EV_Remove, 5000 );
 		}
 	}
 
 	BecomeInactive( TH_THINK );
 	return true;
+
+	} else {
+
+	return false; //should this return false?
+
+	}
 }
 
 /*
@@ -516,7 +633,7 @@ idItem::Event_Touch
 ================
 */
 void idItem::Event_Touch( idEntity *other, trace_t *trace ) {
-	if ( !other->IsType( idPlayer::Type ) ) {
+	if ( !other || !other->IsType( idPlayer::Type ) ) {
 		return;
 	}
 
@@ -550,7 +667,7 @@ idItem::Event_Respawn
 ================
 */
 void idItem::Event_Respawn( void ) {
-	if ( gameLocal.isServer ) {
+	if ( gameLocal.isServer && !gameLocal.mpGame.IsGametypeCoopBased() ) {  //not sending events in coop
 		ServerSendEvent( EVENT_RESPAWN, NULL, false, -1 );
 	}
 	BecomeActive( TH_THINK );
@@ -569,7 +686,7 @@ idItem::Event_RespawnFx
 ================
 */
 void idItem::Event_RespawnFx( void ) {
-	if ( gameLocal.isServer ) {
+	if ( gameLocal.isServer && !gameLocal.mpGame.IsGametypeCoopBased() ) { //not sending events in coop
 		ServerSendEvent( EVENT_RESPAWNFX, NULL, false, -1 );
 	}
 	const char *sfx = spawnArgs.GetString( "fxRespawn" );
@@ -1477,8 +1594,18 @@ idObjective::Event_Trigger
 ================
 */
 void idObjective::Event_Trigger( idEntity *activator ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return; //clients can't touch this
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent( EVENT_TRIGGER, NULL, true, -1 );
+	}
+	gameLocal.Printf("[COOP] idObjective Event_Trigger...\n");
+
 	idPlayer *player = gameLocal.GetLocalPlayer();
-	if ( player ) {
+	if ( player && !player->spectating  ) {
 
 		//Pickup( player );
 
@@ -1520,7 +1647,11 @@ void idObjective::Event_GetPlayerPos() {
 	idPlayer *player = gameLocal.GetLocalPlayer();
 	if ( player ) {
 		playerPos = player->GetPhysics()->GetOrigin();
-		PostEventMS( &EV_HideObjective, 100, player );
+		if (gameLocal.isClient) {
+			CS_PostEventMS( &EV_HideObjective, 100, player );
+		} else {
+			PostEventMS( &EV_HideObjective, 100, player );
+		}
 	}
 }
 
@@ -1535,11 +1666,82 @@ void idObjective::Event_HideObjective(idEntity *e) {
 		idVec3 v = player->GetPhysics()->GetOrigin() - playerPos;
 		if ( v.Length() > 64.0f ) {
 			player->HideObjective();
-			PostEventMS( &EV_Remove, 0 );
+			if (gameLocal.isClient) {
+				CS_PostEventMS( &EV_Remove, 0 );
+			} else {
+				PostEventMS( &EV_Remove, 0 );
+			}
 		} else {
-			PostEventMS( &EV_HideObjective, 100, player );
+			if (gameLocal.isClient) {
+				CS_PostEventMS( &EV_HideObjective, 100, player );
+			} else {
+				PostEventMS( &EV_HideObjective, 100, player );
+			}
 		}
 	}
+}
+
+/*
+================
+idObjective::CS_Event_Trigger
+================
+*/
+void idObjective::CS_Event_Trigger( idEntity *activator ) {
+
+	assert( gameLocal.isClient );
+
+	gameLocal.Printf("[COOP] idObjective CS_Event_Trigger...\n");
+
+	idPlayer *player = gameLocal.GetLocalPlayer();
+	if ( player ) {
+
+		//Pickup( player );
+
+		if ( spawnArgs.GetString( "inv_objective", NULL ) ) {
+			if ( player && player->hud ) {
+				idStr shotName = gameLocal.GetMapName();
+				shotName.StripFileExtension();
+				shotName += "/";
+				shotName += spawnArgs.GetString( "screenshot" );
+				shotName.SetFileExtension( ".tga" );
+				player->hud->SetStateString( "screenshot", shotName );
+				player->hud->SetStateString( "objective", "1" );
+				player->hud->SetStateString( "objectivetext", spawnArgs.GetString( "objectivetext" ) );
+				player->hud->SetStateString( "objectivetitle", spawnArgs.GetString( "objectivetitle" ) );
+				player->GiveObjective( spawnArgs.GetString( "objectivetitle" ), spawnArgs.GetString( "objectivetext" ), shotName );
+
+				// a tad slow but keeps from having to update all objectives in all maps with a name ptr
+				for( int i = 0; i < gameLocal.num_entities; i++ ) {
+					if ( gameLocal.entities[ i ] && gameLocal.entities[ i ]->IsType( idObjectiveComplete::Type ) ) {
+						if ( idStr::Icmp( spawnArgs.GetString( "objectivetitle" ), gameLocal.entities[ i ]->spawnArgs.GetString( "objectivetitle" ) ) == 0 ){
+							gameLocal.entities[ i ]->spawnArgs.SetBool( "objEnabled", true );
+							break;
+						}
+					}
+				}
+				CS_PostEventMS( &EV_GetPlayerPos, 2000 );
+			}
+		}
+	}
+}
+
+/*
+================
+idObjective::ClientReceiveEvent
+================
+*/
+bool	idObjective::ClientReceiveEvent( int event, int time, const idBitMsg &msg )
+{
+	switch( event ) {
+		case EVENT_TRIGGER: {
+			CS_Event_Trigger(NULL);
+			return true;
+		}
+		default:
+			break;
+	}
+
+	return idItem::ClientReceiveEvent( event, time, msg );
 }
 
 /*
@@ -1567,12 +1769,23 @@ idVideoCDItem::GiveToPlayer
 ================
 */
 bool idVideoCDItem::GiveToPlayer( idPlayer *player ) {
+
 	idStr str = spawnArgs.GetString( "video" );
 	if ( player && str.Length() ) {
 		player->GiveVideo( str, &spawnArgs );
 	}
 	return true;
 }
+
+/*
+================
+idVideoCDItem::CS_GiveToPlayer
+================
+*/
+bool idVideoCDItem::CS_GiveToPlayer( idPlayer *player ) {
+	return GiveToPlayer(player); //by now exactly the same
+}
+
 
 /*
 ===============================================================================
@@ -1591,9 +1804,29 @@ idPDAItem::GiveToPlayer
 ================
 */
 bool idPDAItem::GiveToPlayer(idPlayer *player) {
+	if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) { //disable pda pickup in COOP to avoid crash
+		return true;
+	}
+
 	const char *str = spawnArgs.GetString( "pda_name" );
 	if ( player ) {
+		if (gameLocal.mpGame.IsGametypeCoopBased()) {
+			gameLocal.SaveGlobalInventory(&spawnArgs);
+		}
 		player->GivePDA( str, &spawnArgs );
+	}
+	return true;
+}
+
+/*
+================
+idPDAItem::CS_GiveToPlayer
+================
+*/
+bool idPDAItem::CS_GiveToPlayer(idPlayer *player) {
+	const char *str = spawnArgs.GetString( "pda_name" );
+	if ( player ) {
+		player->CS_GivePDA( str, &spawnArgs );
 	}
 	return true;
 }
@@ -1620,6 +1853,7 @@ idMoveableItem::idMoveableItem() {
 	trigger = NULL;
 	smoke = NULL;
 	smokeTime = 0;
+	fl.coopNetworkSync = true; //sync moveable items in coop
 #ifdef _D3XP
 	nextSoundTime = 0;
 #endif
@@ -2004,9 +2238,26 @@ idMoveablePDAItem::GiveToPlayer
 ================
 */
 bool idMoveablePDAItem::GiveToPlayer(idPlayer *player) {
+	if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) { //disable pda pickup in COOP to avoid crash
+		return true;
+	}
+
 	const char *str = spawnArgs.GetString( "pda_name" );
 	if ( player ) {
 		player->GivePDA( str, &spawnArgs );
+	}
+	return true;
+}
+
+/*
+================
+idMoveablePDAItem::CS_GiveToPlayer
+================
+*/
+bool idMoveablePDAItem::CS_GiveToPlayer(idPlayer *player) {
+	const char *str = spawnArgs.GetString( "pda_name" );
+	if ( player ) {
+		player->CS_GivePDA( str, &spawnArgs );
 	}
 	return true;
 }
@@ -2049,6 +2300,11 @@ idItemRemover::Event_Trigger
 ================
 */
 void idItemRemover::Event_Trigger( idEntity *activator ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return; //clients can't touch this
+	}
+
 	if ( activator->IsType( idPlayer::Type ) ) {
 		RemoveItem( static_cast<idPlayer *>(activator) );
 	}
@@ -2111,11 +2367,20 @@ idObjectiveComplete::Event_Trigger
 ================
 */
 void idObjectiveComplete::Event_Trigger( idEntity *activator ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return; //clients can't touch this
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent( EVENT_TRIGGER, NULL, true, -1 );
+	}
+
 	if ( !spawnArgs.GetBool( "objEnabled" ) ) {
 		return;
 	}
 	idPlayer *player = gameLocal.GetLocalPlayer();
-	if ( player ) {
+	if ( player && !player->spectating ) {
 		RemoveItem( player );
 
 		if ( spawnArgs.GetString( "inv_objective", NULL ) ) {
@@ -2144,7 +2409,11 @@ void idObjectiveComplete::Event_GetPlayerPos() {
 	idPlayer *player = gameLocal.GetLocalPlayer();
 	if ( player ) {
 		playerPos = player->GetPhysics()->GetOrigin();
-		PostEventMS( &EV_HideObjective, 100, player );
+		if (gameLocal.isClient) {
+			CS_PostEventMS( &EV_HideObjective, 100, player );
+		} else {
+			PostEventMS( &EV_HideObjective, 100, player );
+		}
 	}
 }
 
@@ -2160,9 +2429,65 @@ void idObjectiveComplete::Event_HideObjective( idEntity *e ) {
 		v -= playerPos;
 		if ( v.Length() > 64.0f ) {
 			player->hud->HandleNamedEvent( "closeObjective" );
-			PostEventMS( &EV_Remove, 0 );
+			if (gameLocal.isClient) {
+				CS_PostEventMS( &EV_Remove, 0 );
+			} else {
+				PostEventMS( &EV_Remove, 0 );
+			}
 		} else {
-			PostEventMS( &EV_HideObjective, 100, player );
+			if (gameLocal.isClient) {
+				CS_PostEventMS( &EV_HideObjective, 100, player );
+			} else {
+				PostEventMS( &EV_HideObjective, 100, player );
+			}
 		}
 	}
+}
+
+/*
+================
+idObjectiveComplete::CS_Event_Trigger
+================
+*/
+void idObjectiveComplete::CS_Event_Trigger( idEntity *activator ) {
+
+	assert(gameLocal.isClient);
+
+	if ( !spawnArgs.GetBool( "objEnabled" ) ) {
+		return;
+	}
+	idPlayer *player = gameLocal.GetLocalPlayer();
+	gameLocal.Printf("[COOP] idObjectiveComplete..\n");
+	if ( player && !player->spectating ) {
+		RemoveItem( player );
+
+		if ( spawnArgs.GetString( "inv_objective", NULL ) ) {
+			if ( player->hud ) {
+				player->hud->SetStateString( "objective", "2" );
+				player->hud->SetStateString( "objectivetext", spawnArgs.GetString( "objectivetext" ) );
+				player->hud->SetStateString( "objectivetitle", spawnArgs.GetString( "objectivetitle" ) );
+				player->CompleteObjective( spawnArgs.GetString( "objectivetitle" ) );
+				CS_PostEventMS( &EV_GetPlayerPos, 2000 );
+			}
+		}
+	}
+}
+
+/*
+================
+idObjectiveComplete::ClientReceiveEvent
+================
+*/
+bool idObjectiveComplete::ClientReceiveEvent( int event, int time, const idBitMsg &msg )
+{
+	switch( event ) {
+		case EVENT_TRIGGER: {
+			CS_Event_Trigger(NULL);
+			return true;
+		}
+		default:
+			break;
+	}
+
+	return idEntity::ClientReceiveEvent( event, time, msg );
 }

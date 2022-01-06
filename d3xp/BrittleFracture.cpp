@@ -71,6 +71,8 @@ idBrittleFracture::idBrittleFracture( void ) {
 	changed = false;
 
 	fl.networkSync = true;
+	fl.coopNetworkSync = true;
+	eventSyncVital = false;
 
 #ifdef _D3XP
 	isXraySurface = false;
@@ -297,12 +299,17 @@ void idBrittleFracture::Spawn( void ) {
 
 		isXraySurface = false;
 
-		for ( int i = 0; i < model->NumSurfaces(); i++ ) {
-			const modelSurface_t *surf = model->Surface( i );
+		if (!model && gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+			common->Warning("[COOP FATAL] Avoiding crash at idBrittleFracture::Spawn\n");
+		} else {
 
-			if ( idStr( surf->shader->GetName() ) == "textures/smf/window_scratch" ) {
-				isXraySurface = true;
-				break;
+			for (int i = 0; i < model->NumSurfaces(); i++) {
+				const modelSurface_t* surf = model->Surface(i);
+
+				if (idStr(surf->shader->GetName()) == "textures/smf/window_scratch") {
+					isXraySurface = true;
+					break;
+				}
 			}
 		}
 	}

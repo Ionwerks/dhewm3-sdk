@@ -28,6 +28,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "sys/platform.h"
 #include "idlib/math/Quat.h"
+#include "framework/async/NetworkSystem.h" 
 #include "framework/DeclEntityDef.h"
 
 #include "gamesys/SysCvar.h"
@@ -392,6 +393,23 @@ idAI::idAI() {
 	eyeFocusRate		= 0.0f;
 	headFocusRate		= 0.0f;
 	focusAlignTime		= 0;
+
+	//Added by Stradex for Coop
+	lastDamageDef			= 0;
+	lastDamageDir			= vec3_zero;
+	turnTowardPos			= vec3_zero;
+	lastDamageLocation		= 0;
+	//fl.networkSync		= true;
+	fl.coopNetworkSync		= true;
+	currentAttackDefNum = -1;
+	currentNetAction = NETACTION_NONE;
+	forceNetworkSync = true; //added by Stradex for Coop
+	snapshotPriority = 2; //added by Stradex for coop. High priority for this
+	thereWasEnemy = true; //shouldn't this be false?
+	currentChannelOverride = 0;
+
+	oldHealth = 0; // To check if an entity was resurrected to inform the client about it (used in conjunction with g_clientsideDamage)
+	allowFastMonsters = true;
 }
 
 /*
@@ -799,6 +817,8 @@ void idAI::Spawn( void ) {
 
 	spawnArgs.GetFloat( "turn_rate",			"360",		turnRate );
 
+	spawnArgs.GetBool("allow_fast_monsters",	"1",		allowFastMonsters); //For coop
+
 	spawnArgs.GetBool( "talks",					"0",		talks );
 	if ( spawnArgs.GetString( "npc_name", NULL ) != NULL ) {
 		if ( talks ) {
@@ -821,12 +841,22 @@ void idAI::Spawn( void ) {
 	spawnArgs.GetInt(	"num_cinematics",		"0",		num_cinematics );
 	current_cinematic = 0;
 
-	LinkScriptVariables();
+	if (!gameLocal.mpGame.IsGametypeCoopBased() || !gameLocal.isRestartingMap) { //fix for coop
+		LinkScriptVariables();
+	}
 
 	fl.takedamage		= !spawnArgs.GetBool( "noDamage" );
 	enemy				= NULL;
 	allowMove			= true;
 	allowHiddenMovement = false;
+
+	//FIXME: I only exist to avoid a crash when killing an AI with a model_death (ex: lost soul) in coop
+	haveModelDeath = false;
+	const char* modelDeath;
+	if (spawnArgs.GetString( "model_death", "", &modelDeath )) {
+		haveModelDeath = true;
+	}
+	//end FIXME
 
 	animator.RemoveOriginOffset( true );
 
@@ -919,9 +949,9 @@ void idAI::Spawn( void ) {
 		physicsObj.SetClipMask( MASK_MONSTERSOLID & ~CONTENTS_BODY );
 	} else {
 		if ( use_combat_bbox ) {
-			physicsObj.SetContents( CONTENTS_BODY|CONTENTS_SOLID );
+			physicsObj.SetContents( CONTENTS_BODY|CONTENTS_SOLID|CONTENTS_PLAYERCLIP ); //CONTENTS_PLAYERCLIP added for coop
 		} else {
-			physicsObj.SetContents( CONTENTS_BODY );
+			physicsObj.SetContents( CONTENTS_BODY|CONTENTS_PLAYERCLIP );//CONTENTS_PLAYERCLIP added for coop
 		}
 		physicsObj.SetClipMask( MASK_MONSTERSOLID );
 	}
@@ -967,11 +997,13 @@ void idAI::Spawn( void ) {
 	useBoneAxis = spawnArgs.GetBool( "useBoneAxis" );
 	SpawnParticles( "smokeParticleSystem" );
 
-	if ( num_cinematics || spawnArgs.GetBool( "hide" ) || spawnArgs.GetBool( "teleport" ) || spawnArgs.GetBool( "trigger_anim" ) ) {
+	if ( num_cinematics || spawnArgs.GetBool( "hide" ) || spawnArgs.GetBool( "teleport" ) || spawnArgs.GetBool( "trigger_anim" ) || gameLocal.isClient  ) {
 		fl.takedamage = false;
 		physicsObj.SetContents( 0 );
 		physicsObj.GetClipModel()->Unlink();
-		Hide();
+		if (!gameLocal.mpGame.IsGametypeCoopBased() || !gameLocal.isRestartingMap) { //fix for coop
+			Hide();
+		}
 	} else {
 		// play a looping ambient sound if we have one
 		StartSound( "snd_ambient", SND_CHANNEL_AMBIENT, 0, false, NULL );
@@ -981,6 +1013,8 @@ void idAI::Spawn( void ) {
 		gameLocal.Warning( "entity '%s' doesn't have health set", name.c_str() );
 		health = 1;
 	}
+
+	oldHealth = health;
 
 	// set up monster chatter
 	SetChatSound();
@@ -993,7 +1027,10 @@ void idAI::Spawn( void ) {
 	}
 
 	// init the move variables
-	StopMove( MOVE_STATUS_DONE );
+	if (!gameLocal.mpGame.IsGametypeCoopBased() || !gameLocal.isRestartingMap) { //fix for coop
+		// init the move variables
+		StopMove( MOVE_STATUS_DONE );
+	}
 
 
 #ifdef _D3XP
@@ -1011,6 +1048,21 @@ void idAI::Gib( const idVec3 &dir, const char *damageDefName ) {
 	idActor::Gib(dir, damageDefName);
 }
 #endif
+
+/*
+===================
+idAI::Init_CoopScriptFix
+Ugly shitty hack to fix something related to script and localMapRestart in coop
+===================
+*/
+
+void idAI::Init_CoopScriptFix( void ) {
+	LinkScriptVariables();
+	if ( num_cinematics || spawnArgs.GetBool( "hide" ) || spawnArgs.GetBool( "teleport" ) || spawnArgs.GetBool( "trigger_anim" ) || gameLocal.isClient ) {
+		Hide();
+	} 
+	StopMove( MOVE_STATUS_DONE );
+}
 
 /*
 ===================
@@ -1127,6 +1179,35 @@ idAI::Think
 =====================
 */
 void idAI::Think( void ) {
+
+	currentTorsoAnim = animator.CurrentAnim( ANIMCHANNEL_TORSO )->AnimNum(); //added by Stradex for coop
+	currentLegsAnim = animator.CurrentAnim( ANIMCHANNEL_LEGS )->AnimNum(); //added by Stradex for coop
+
+	if (head.GetEntity()) {
+		currentHeadAnim = head.GetEntity()->GetAnimator()->CurrentAnim(ANIMCHANNEL_ALL)->AnimNum();
+	}
+
+	if (g_fastMonsters.GetBool() && allowFastMonsters && team == 1) {
+		if (gameLocal.inCinematic) {
+			animator.UpdateFrameRateMultiplier(1.0f);
+		}
+		else {
+			animator.UpdateFrameRateMultiplier(FM_SPEED_MULTIPLIER);
+		}
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && g_clientsideDamage.GetBool() && oldHealth <= 0 && health > 0) {
+		idBitMsg	msg;
+		byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+
+		msg.Init(msgBuf, sizeof(msgBuf));
+		msg.BeginWriting();
+		msg.WriteShort(health);
+		ServerSendEvent(EVENT_RESURRECTED, &msg, false, -1);
+	}
+
+	oldHealth = health;
+
 	// if we are completely closed off from the player, don't do anything at all
 	if ( CheckDormant() ) {
 		return;
@@ -1136,9 +1217,12 @@ void idAI::Think( void ) {
 		// clear out the enemy when he dies or is hidden
 		idActor *enemyEnt = enemy.GetEntity();
 		if ( enemyEnt ) {
+			thereWasEnemy = true;
 			if ( enemyEnt->health <= 0 ) {
 				EnemyDead();
 			}
+		} else if (gameLocal.mpGame.IsGametypeCoopBased() && thereWasEnemy) { //COOP: probably a player disconnected from server
+			ClearEnemy();
 		}
 
 		current_yaw += deltaViewAngles.yaw;
@@ -2747,16 +2831,20 @@ void idAI::AnimMove( void ) {
 
 	move.obstacle = NULL;
 	if ( ( move.moveCommand == MOVE_FACE_ENEMY ) && enemy.GetEntity() ) {
+		turnTowardPos = lastVisibleEnemyPos; //added for COOP
 		TurnToward( lastVisibleEnemyPos );
 		goalPos = oldorigin;
 	} else if ( ( move.moveCommand == MOVE_FACE_ENTITY ) && move.goalEntity.GetEntity() ) {
+		turnTowardPos = move.goalEntity.GetEntity()->GetPhysics()->GetOrigin(); //added for COOP
 		TurnToward( move.goalEntity.GetEntity()->GetPhysics()->GetOrigin() );
 		goalPos = oldorigin;
 	} else if ( GetMovePos( goalPos ) ) {
 		if ( move.moveCommand != MOVE_WANDER ) {
 			CheckObstacleAvoidance( goalPos, newDest );
+			turnTowardPos = newDest; //added for COOP
 			TurnToward( newDest );
 		} else {
+			turnTowardPos = goalPos; //added for COOP
 			TurnToward( goalPos );
 		}
 	}
@@ -2800,7 +2888,7 @@ void idAI::AnimMove( void ) {
 	}
 
 	if ( !af_push_moveables && attack.Length() && TestMelee() ) {
-		DirectDamage( attack, enemy.GetEntity() );
+		DirectDamage( attack, enemy.GetEntity(), true);
 	} else {
 		idEntity *blockEnt = physicsObj.GetSlideMoveEntity();
 		if ( blockEnt && blockEnt->IsType( idMoveable::Type ) && blockEnt->GetPhysics()->IsPushable() ) {
@@ -2866,13 +2954,16 @@ void idAI::SlideMove( void ) {
 
 	move.obstacle = NULL;
 	if ( ( move.moveCommand == MOVE_FACE_ENEMY ) && enemy.GetEntity() ) {
+		turnTowardPos = lastVisibleEnemyPos; //added for COOP
 		TurnToward( lastVisibleEnemyPos );
 		goalPos = move.moveDest;
 	} else if ( ( move.moveCommand == MOVE_FACE_ENTITY ) && move.goalEntity.GetEntity() ) {
+		turnTowardPos = move.goalEntity.GetEntity()->GetPhysics()->GetOrigin(); //added for COOP
 		TurnToward( move.goalEntity.GetEntity()->GetPhysics()->GetOrigin() );
 		goalPos = move.moveDest;
 	} else if ( GetMovePos( goalPos ) ) {
 		CheckObstacleAvoidance( goalPos, newDest );
+		turnTowardPos = newDest; //added for COOP
 		TurnToward( newDest );
 		goalPos = newDest;
 	}
@@ -2911,11 +3002,14 @@ void idAI::SlideMove( void ) {
 	RunPhysics();
 
 	if ( ( move.moveCommand == MOVE_FACE_ENEMY ) && enemy.GetEntity() ) {
+		turnTowardPos = lastVisibleEnemyPos; //added for COOP
 		TurnToward( lastVisibleEnemyPos );
 	} else if ( ( move.moveCommand == MOVE_FACE_ENTITY ) && move.goalEntity.GetEntity() ) {
+		turnTowardPos = move.goalEntity.GetEntity()->GetPhysics()->GetOrigin(); //added for COOP
 		TurnToward( move.goalEntity.GetEntity()->GetPhysics()->GetOrigin() );
 	} else if ( move.moveCommand != MOVE_NONE ) {
 		if ( vel.ToVec2().LengthSqr() > 0.1f ) {
+			//FIXME: sync this to clients
 			TurnToward( vel.ToYaw() );
 		}
 	}
@@ -2926,7 +3020,7 @@ void idAI::SlideMove( void ) {
 	}
 
 	if ( !af_push_moveables && attack.Length() && TestMelee() ) {
-		DirectDamage( attack, enemy.GetEntity() );
+		DirectDamage( attack, enemy.GetEntity(), true );
 	} else {
 		idEntity *blockEnt = physicsObj.GetSlideMoveEntity();
 		if ( blockEnt && blockEnt->IsType( idMoveable::Type ) && blockEnt->GetPhysics()->IsPushable() ) {
@@ -3106,8 +3200,10 @@ idAI::FlyTurn
 */
 void idAI::FlyTurn( void ) {
 	if ( move.moveCommand == MOVE_FACE_ENEMY ) {
+		turnTowardPos = lastVisibleEnemyPos; //added for COOP
 		TurnToward( lastVisibleEnemyPos );
 	} else if ( ( move.moveCommand == MOVE_FACE_ENTITY ) && move.goalEntity.GetEntity() ) {
+		turnTowardPos = move.goalEntity.GetEntity()->GetPhysics()->GetOrigin(); //added for COOP
 		TurnToward( move.goalEntity.GetEntity()->GetPhysics()->GetOrigin() );
 	} else if ( move.speed > 0.0f ) {
 		const idVec3 &vel = physicsObj.GetLinearVelocity();
@@ -3174,7 +3270,7 @@ void idAI::FlyMove( void ) {
 
 	monsterMoveResult_t	moveResult = physicsObj.GetMoveResult();
 	if ( !af_push_moveables && attack.Length() && TestMelee() ) {
-		DirectDamage( attack, enemy.GetEntity() );
+		DirectDamage( attack, enemy.GetEntity(), true );
 	} else {
 		idEntity *blockEnt = physicsObj.GetSlideMoveEntity();
 		if ( blockEnt && blockEnt->IsType( idMoveable::Type ) && blockEnt->GetPhysics()->IsPushable() ) {
@@ -3228,7 +3324,7 @@ void idAI::StaticMove( void ) {
 	AI_ONGROUND = false;
 
 	if ( !af_push_moveables && attack.Length() && TestMelee() ) {
-		DirectDamage( attack, enemyEnt );
+		DirectDamage( attack, enemyEnt, true );
 	}
 
 	if ( ai_debugMove.GetBool() ) {
@@ -3251,6 +3347,10 @@ idAI::ReactionTo
 =====================
 */
 int idAI::ReactionTo( const idEntity *ent ) {
+
+	if (!ent) {
+		return ATTACK_IGNORE; //bugged?, to avoid crash in coop
+	}
 
 	if ( ent->fl.hidden ) {
 		// ignore hidden entities
@@ -3308,7 +3408,7 @@ bool idAI::Pain( idEntity *inflictor, idEntity *attacker, int damage, const idVe
 			AI_SPECIAL_DAMAGE = 0;
 		}
 
-		if ( enemy.GetEntity() != attacker && attacker->IsType( idActor::Type ) ) {
+		if ( enemy.GetEntity() != attacker && attacker->IsType( idActor::Type ) && !gameLocal.isClient  ) {
 			actor = ( idActor * )attacker;
 			if ( ReactionTo( actor ) & ATTACK_ON_DAMAGE ) {
 				gameLocal.AlertAI( actor );
@@ -3316,6 +3416,10 @@ bool idAI::Pain( idEntity *inflictor, idEntity *attacker, int damage, const idVe
 			}
 		}
 	}
+
+	//Added by Stradex for Coop
+	lastDamageDir = dir;
+	lastDamageLocation = location;
 
 	return ( AI_PAIN != 0 );
 }
@@ -3393,6 +3497,23 @@ idAI::Killed
 =====================
 */
 void idAI::Killed( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location ) {
+
+	if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased() && g_clientsideDamage.GetBool()) {
+		idBitMsg	msg;
+		byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+
+		msg.Init( msgBuf, sizeof( msgBuf ) );
+		msg.BeginWriting();
+		msg.WriteBits( gameLocal.localClientNum, idMath::BitsForInteger(MAX_CLIENTS) );
+		msg.WriteShort(clientsideDamageLocation);
+		msg.WriteFloat( clientsideDamageDir.x );
+		msg.WriteFloat( clientsideDamageDir.y );
+		msg.WriteFloat( clientsideDamageDir.z );
+		ClientSendEvent( EVENT_CLIENTKILL, NULL );
+		nextTimeHealthReaded = gameLocal.clientsideTime + 1000;
+		return CSKilled();
+	}
+
 	idAngles ang;
 	const char *modelDeath;
 
@@ -3454,12 +3575,12 @@ void idAI::Killed( idEntity *inflictor, idEntity *attacker, int damage, const id
 	Unbind();
 
 	if ( StartRagdoll() ) {
-		StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL );
+		StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL ); //now in coop this is handled clientside
 	}
 
 	if ( spawnArgs.GetString( "model_death", "", &modelDeath ) ) {
 		// lost soul is only case that does not use a ragdoll and has a model_death so get the death sound in here
-		StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL );
+		StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL ); //now in coop this is handled clientside
 		renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] = -MS2SEC( gameLocal.time );
 		SetModel( modelDeath );
 		physicsObj.SetLinearVelocity( vec3_zero );
@@ -3492,6 +3613,10 @@ void idAI::Killed( idEntity *inflictor, idEntity *attacker, int damage, const id
 		static_cast< idPlayer* >( attacker )->AddAIKill();
 	}
 #endif
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && attacker && attacker->IsType(idPlayer::Type)) {
+		gameLocal.mpGame.IncrementFrags(static_cast<idPlayer*>(attacker));
+	}
 
 #ifdef _D3XP
 	if(spawnArgs.GetBool("harvest_on_death")) {
@@ -3534,7 +3659,13 @@ void idAI::PlayCinematic( void ) {
 			Hide();
 		}
 		current_cinematic = 0;
-		ActivateTargets( gameLocal.GetLocalPlayer() );
+		if (!gameLocal.mpGame.IsGametypeCoopBased() || gameLocal.isServer) {
+			if (gameLocal.mpGame.IsGametypeCoopBased()) {
+				ActivateTargets(gameLocal.GetCoopPlayer()); 
+			} else {
+				ActivateTargets(gameLocal.GetLocalPlayer());  
+			}
+		}
 		fl.neverDormant = false;
 		return;
 	}
@@ -3614,7 +3745,11 @@ void idAI::Activate( idEntity *activator ) {
 	} else {
 		AI_ACTIVATED = true;
 		if ( !activator || !activator->IsType( idPlayer::Type ) ) {
-			player = gameLocal.GetLocalPlayer();
+			if (gameLocal.mpGame.IsGametypeCoopBased()) {
+				player = GetClosestPlayer();
+			} else {
+				player = gameLocal.GetLocalPlayer();
+			}
 		} else {
 			player = static_cast<idPlayer *>( activator );
 		}
@@ -4093,6 +4228,7 @@ bool idAI::GetAimDir( const idVec3 &firePos, idEntity *aimAtEnt, const idEntity 
 	idVec3	targetPos2;
 	idVec3	delta;
 	float	max_height;
+	float	speed_multiplier = 1.0f;
 	bool	result;
 
 	// if no aimAtEnt or projectile set
@@ -4105,7 +4241,7 @@ bool idAI::GetAimDir( const idVec3 &firePos, idEntity *aimAtEnt, const idEntity 
 		CreateProjectileClipModel();
 	}
 
-	if ( aimAtEnt == enemy.GetEntity() ) {
+	if ( aimAtEnt == enemy.GetEntity() && !gameLocal.isClient  ) {
 		static_cast<idActor *>( aimAtEnt )->GetAIAimTargets( lastVisibleEnemyPos, targetPos1, targetPos2 );
 	} else if ( aimAtEnt->IsType( idActor::Type ) ) {
 		static_cast<idActor *>( aimAtEnt )->GetAIAimTargets( aimAtEnt->GetPhysics()->GetOrigin(), targetPos1, targetPos2 );
@@ -4121,10 +4257,14 @@ bool idAI::GetAimDir( const idVec3 &firePos, idEntity *aimAtEnt, const idEntity 
 	}
 #endif
 
+	if (g_fastMonsters.GetBool() && team == 1) { //FIXME: allowFastMonsters false keeps firing fast projectiles nonetheless
+		speed_multiplier = FM_PROJECTILE_SPEED_MULTIPLIER;
+	}
+
 	// try aiming for chest
 	delta = firePos - targetPos1;
 	max_height = delta.LengthFast() * projectile_height_to_distance_ratio;
-	result = PredictTrajectory( firePos, targetPos1, projectileSpeed, projectileGravity, projectileClipModel, MASK_SHOT_RENDERMODEL, max_height, ignore, aimAtEnt, ai_debugTrajectory.GetBool() ? 1000 : 0, aimDir );
+	result = PredictTrajectory( firePos, targetPos1, projectileSpeed*speed_multiplier, projectileGravity, projectileClipModel, MASK_SHOT_RENDERMODEL, max_height, ignore, aimAtEnt, ai_debugTrajectory.GetBool() ? 1000 : 0, aimDir );
 	if ( result || !aimAtEnt->IsType( idActor::Type ) ) {
 		return result;
 	}
@@ -4132,7 +4272,7 @@ bool idAI::GetAimDir( const idVec3 &firePos, idEntity *aimAtEnt, const idEntity 
 	// try aiming for head
 	delta = firePos - targetPos2;
 	max_height = delta.LengthFast() * projectile_height_to_distance_ratio;
-	result = PredictTrajectory( firePos, targetPos2, projectileSpeed, projectileGravity, projectileClipModel, MASK_SHOT_RENDERMODEL, max_height, ignore, aimAtEnt, ai_debugTrajectory.GetBool() ? 1000 : 0, aimDir );
+	result = PredictTrajectory( firePos, targetPos2, projectileSpeed*speed_multiplier, projectileGravity, projectileClipModel, MASK_SHOT_RENDERMODEL, max_height, ignore, aimAtEnt, ai_debugTrajectory.GetBool() ? 1000 : 0, aimDir );
 
 	return result;
 }
@@ -4144,6 +4284,15 @@ idAI::BeginAttack
 */
 void idAI::BeginAttack( const char *name ) {
 	attack = name;
+
+	if (attack.Length() && gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		const idDeclEntityDef *meleeDef = gameLocal.FindEntityDef( attack, false );
+		if ( !meleeDef ) {
+			gameLocal.Error( "Unknown damage def '%s' on '%s'", attack.c_str(), this->name.c_str() );
+		}
+		currentAttackDefNum = meleeDef->Index();
+	}
+
 	lastAttackTime = gameLocal.time;
 }
 
@@ -4154,6 +4303,7 @@ idAI::EndAttack
 */
 void idAI::EndAttack( void ) {
 	attack = "";
+	currentAttackDefNum = -1; 
 }
 
 /*
@@ -4166,7 +4316,15 @@ idProjectile *idAI::CreateProjectile( const idVec3 &pos, const idVec3 &dir ) {
 	const char *clsname;
 
 	if ( !projectile.GetEntity() ) {
-		gameLocal.SpawnEntityDef( *projectileDef, &ent, false );
+		if (gameLocal.mpGame.IsGametypeCoopBased() && g_clientsideDamage.GetBool()) {
+			idDict			args;
+			args.Clear();
+			args.Copy(*projectileDef);
+			args.Set("clientside", "1");
+			gameLocal.SpawnEntityDef( args, &ent, false , true );
+		} else {
+			gameLocal.SpawnEntityDef( *projectileDef, &ent, false );
+		}
 		if ( !ent ) {
 			clsname = projectileDef->GetString( "classname" );
 			gameLocal.Error( "Could not spawn entityDef '%s'", clsname );
@@ -4177,6 +4335,10 @@ idProjectile *idAI::CreateProjectile( const idVec3 &pos, const idVec3 &dir ) {
 			gameLocal.Error( "'%s' is not an idProjectile", clsname );
 		}
 		projectile = ( idProjectile * )ent;
+	}
+
+	if (g_clientsideDamage.GetBool() && gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) {
+		projectile.GetEntity()->allowClientsideThink = true;
 	}
 
 	projectile.GetEntity()->Create( this, pos, dir );
@@ -4191,7 +4353,11 @@ idAI::RemoveProjectile
 */
 void idAI::RemoveProjectile( void ) {
 	if ( projectile.GetEntity() ) {
-		projectile.GetEntity()->PostEventMS( &EV_Remove, 0 );
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && projectile.GetEntity()->clientsideNode.InList()) {
+			projectile.GetEntity()->CS_PostEventMS( &EV_Remove, 0 );
+		} else {
+			projectile.GetEntity()->PostEventMS( &EV_Remove, 0 );
+		}
 		projectile = NULL;
 	}
 }
@@ -4243,6 +4409,10 @@ idProjectile *idAI::LaunchProjectile( const char *jointname, idEntity *target, b
 
 	if ( !projectile.GetEntity() ) {
 		CreateProjectile( muzzle, axis[ 0 ] );
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && g_clientsideDamage.GetBool() && !projectile.GetEntity()->clientsideNode.InList()) {
+		projectile.GetEntity()->ForceClientsideEntityHack();
 	}
 
 	lastProjectile = projectile.GetEntity();
@@ -4335,6 +4505,147 @@ idProjectile *idAI::LaunchProjectile( const char *jointname, idEntity *target, b
 }
 
 /*
+=====================
+idAI::CS_LaunchProjectile
+=====================
+*/
+
+idProjectile *idAI::CS_LaunchProjectile( idVec3 muzzle, idVec3 inidir, idEntity *target, bool clampToAttackCone ) {
+	idVec3				dir;
+	idVec3				start;
+	trace_t				tr;
+	idBounds			projBounds;
+	float				distance;
+	const idClipModel	*projClip;
+	float				attack_accuracy;
+	float				attack_cone;
+	float				projectile_spread;
+	float				diff;
+	float				angle;
+	float				spin;
+	idAngles			ang;
+	int					num_projectiles;
+	int					i;
+	idMat3				axis;
+	idVec3				tmp;
+	idProjectile		*lastProjectile;
+#ifdef _D3XP
+	idMat3				proj_axis;
+	bool				forceMuzzle;
+#endif
+
+	if ( !projectileDef ) {
+		gameLocal.Warning( "%s (%s) doesn't have a projectile specified", name.c_str(), GetEntityDefName() );
+		return NULL;
+	}
+
+	attack_accuracy = spawnArgs.GetFloat( "attack_accuracy", "7" );
+	attack_cone = spawnArgs.GetFloat( "attack_cone", "70" );
+	projectile_spread = spawnArgs.GetFloat( "projectile_spread", "0" );
+	num_projectiles = spawnArgs.GetInt( "num_projectiles", "1" );
+#ifdef _D3XP
+	forceMuzzle = spawnArgs.GetBool( "forceMuzzle", "0" );
+#endif
+
+	if ( !projectile.GetEntity() ) {
+		CreateProjectile( muzzle, inidir );
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && g_clientsideDamage.GetBool() && !projectile.GetEntity()->clientsideNode.InList()) {
+		projectile.GetEntity()->ForceClientsideEntityHack();
+	}
+
+	lastProjectile = projectile.GetEntity();
+
+	if ( target != NULL ) {
+		tmp = target->GetPhysics()->GetAbsBounds().GetCenter() - muzzle;
+		tmp.Normalize();
+		axis = tmp.ToMat3();
+	} else {
+		axis = viewAxis;
+	}
+
+	// rotate it because the cone points up by default
+	tmp = axis[2];
+	axis[2] = axis[0];
+	axis[0] = -tmp;
+
+#ifdef _D3XP
+	proj_axis = axis;
+#endif
+
+	if ( !forceMuzzle ) {	// _D3XP
+		// make sure the projectile starts inside the monster bounding box
+		const idBounds &ownerBounds = physicsObj.GetAbsBounds();
+		projClip = lastProjectile->GetPhysics()->GetClipModel();
+		projBounds = projClip->GetBounds().Rotate( axis );
+
+		// check if the owner bounds is bigger than the projectile bounds
+		if ( ( ( ownerBounds[1][0] - ownerBounds[0][0] ) > ( projBounds[1][0] - projBounds[0][0] ) ) &&
+			( ( ownerBounds[1][1] - ownerBounds[0][1] ) > ( projBounds[1][1] - projBounds[0][1] ) ) &&
+			( ( ownerBounds[1][2] - ownerBounds[0][2] ) > ( projBounds[1][2] - projBounds[0][2] ) ) ) {
+			if ( (ownerBounds - projBounds).RayIntersection( muzzle, viewAxis[ 0 ], distance ) ) {
+				start = muzzle + distance * viewAxis[ 0 ];
+			} else {
+				start = ownerBounds.GetCenter();
+			}
+		} else {
+			// projectile bounds bigger than the owner bounds, so just start it from the center
+			start = ownerBounds.GetCenter();
+		}
+
+		gameLocal.clip.Translation( tr, start, muzzle, projClip, axis, MASK_SHOT_RENDERMODEL, this );
+		muzzle = tr.endpos;
+	}
+
+	// set aiming direction
+	GetAimDir( muzzle, target, this, dir );
+	ang = dir.ToAngles();
+
+	// adjust his aim so it's not perfect.  uses sine based movement so the tracers appear less random in their spread.
+	float t = MS2SEC( gameLocal.time + entityNumber * 497 );
+	ang.pitch += idMath::Sin16( t * 5.1 ) * attack_accuracy;
+	ang.yaw	+= idMath::Sin16( t * 6.7 ) * attack_accuracy;
+
+	if ( clampToAttackCone ) {
+		// clamp the attack direction to be within monster's attack cone so he doesn't do
+		// things like throw the missile backwards if you're behind him
+		diff = idMath::AngleDelta( ang.yaw, current_yaw );
+		if ( diff > attack_cone ) {
+			ang.yaw = current_yaw + attack_cone;
+		} else if ( diff < -attack_cone ) {
+			ang.yaw = current_yaw - attack_cone;
+		}
+	}
+
+	axis = ang.ToMat3();
+
+	float spreadRad = DEG2RAD( projectile_spread );
+	for( i = 0; i < num_projectiles; i++ ) {
+		// spread the projectiles out
+		angle = idMath::Sin( spreadRad * gameLocal.random.RandomFloat() );
+		spin = (float)DEG2RAD( 360.0f ) * gameLocal.random.RandomFloat();
+		dir = axis[ 0 ] + axis[ 2 ] * ( angle * idMath::Sin( spin ) ) - axis[ 1 ] * ( angle * idMath::Cos( spin ) );
+		dir.Normalize();
+
+		// launch the projectile
+		if ( !projectile.GetEntity() ) {
+			CreateProjectile( muzzle, dir );
+		}
+		lastProjectile = projectile.GetEntity();
+		lastProjectile->Launch( muzzle, dir, vec3_origin );
+		projectile = NULL;
+	}
+
+	TriggerWeaponEffects( muzzle );
+
+	lastAttackTime = gameLocal.time;
+
+	return lastProjectile;
+}
+
+
+/*
 ================
 idAI::DamageFeedback
 
@@ -4364,7 +4675,7 @@ kickDir is specified in the monster's coordinate system, and gives the direction
 that the view kick and knockback should go
 =====================
 */
-void idAI::DirectDamage( const char *meleeDefName, idEntity *ent ) {
+void idAI::DirectDamage( const char *meleeDefName, idEntity *ent, const bool canBeClientDamage ) {
 	const idDict *meleeDef;
 	const char *p;
 	const idSoundShader *shader;
@@ -4374,7 +4685,7 @@ void idAI::DirectDamage( const char *meleeDefName, idEntity *ent ) {
 		gameLocal.Error( "Unknown damage def '%s' on '%s'", meleeDefName, name.c_str() );
 	}
 
-	if ( !ent->fl.takedamage ) {
+	if ( !ent->fl.takedamage && (!gameLocal.isClient || gameLocal.mpGame.IsGametypeCoopBased())) {
 		const idSoundShader *shader = declManager->FindSound(meleeDef->GetString( "snd_miss" ));
 		StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
 		return;
@@ -4384,7 +4695,7 @@ void idAI::DirectDamage( const char *meleeDefName, idEntity *ent ) {
 	// do the damage
 	//
 	p = meleeDef->GetString( "snd_hit" );
-	if ( p && *p ) {
+	if ( p && *p && (!gameLocal.isClient || gameLocal.mpGame.IsGametypeCoopBased())) {
 		shader = declManager->FindSound( p );
 		StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
 	}
@@ -4395,7 +4706,7 @@ void idAI::DirectDamage( const char *meleeDefName, idEntity *ent ) {
 	idVec3	globalKickDir;
 	globalKickDir = ( viewAxis * physicsObj.GetGravityAxis() ) * kickDir;
 
-	ent->Damage( this, this, globalKickDir, meleeDefName, 1.0f, INVALID_JOINT );
+	ent->Damage( this, this, globalKickDir, meleeDefName, 1.0f, INVALID_JOINT, canBeClientDamage );
 
 	// end the attack if we're a multiframe attack
 	EndAttack();
@@ -4478,7 +4789,11 @@ bool idAI::AttackMelee( const char *meleeDefName ) {
 		p = meleeDef->GetString( "snd_miss" );
 		if ( p && *p ) {
 			shader = declManager->FindSound( p );
-			StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
+			if (gameLocal.mpGame.IsGametypeCoopBased()) {
+				StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, true, NULL ); //broadcast in coop
+			} else {
+				StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
+			}
 		}
 		return false;
 	}
@@ -4510,7 +4825,11 @@ bool idAI::AttackMelee( const char *meleeDefName ) {
 		p = meleeDef->GetString( "snd_miss" );
 		if ( p && *p ) {
 			shader = declManager->FindSound( p );
-			StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
+			if (gameLocal.mpGame.IsGametypeCoopBased()) {
+				StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, true, NULL ); //broadcast in coop
+			} else {
+				StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
+			}
 		}
 		return false;
 	}
@@ -4521,7 +4840,11 @@ bool idAI::AttackMelee( const char *meleeDefName ) {
 	p = meleeDef->GetString( "snd_hit" );
 	if ( p && *p ) {
 		shader = declManager->FindSound( p );
-		StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
+		if (gameLocal.mpGame.IsGametypeCoopBased()) {
+			StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, true, NULL ); //broadcast in coop
+		} else {
+			StartSoundShader( shader, SND_CHANNEL_DAMAGE, 0, false, NULL );
+		}
 	}
 
 	idVec3	kickDir;
@@ -4667,6 +4990,11 @@ idAI::Hide
 ================
 */
 void idAI::Hide( void ) {
+
+	if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()) {
+		currentNetAction = NETACTION_HIDE; //added by Stradex for COOP
+	}
+
 	idActor::Hide();
 	fl.takedamage = false;
 	physicsObj.SetContents( 0 );
@@ -4685,13 +5013,18 @@ idAI::Show
 ================
 */
 void idAI::Show( void ) {
+
+	if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()) {
+		currentNetAction = NETACTION_SHOW; //added by Stradex for COOP
+	}
+
 	idActor::Show();
 	if ( spawnArgs.GetBool( "big_monster" ) ) {
 		physicsObj.SetContents( 0 );
 	} else if ( use_combat_bbox ) {
-		physicsObj.SetContents( CONTENTS_BODY|CONTENTS_SOLID );
+		physicsObj.SetContents( CONTENTS_BODY | CONTENTS_SOLID | CONTENTS_PLAYERCLIP);
 	} else {
-		physicsObj.SetContents( CONTENTS_BODY );
+		physicsObj.SetContents( CONTENTS_BODY | CONTENTS_PLAYERCLIP);
 	}
 	physicsObj.GetClipModel()->Link( gameLocal.clip );
 	fl.takedamage = !spawnArgs.GetBool( "noDamage" );
@@ -4769,7 +5102,11 @@ void idAI::PlayChatter( void ) {
 		return;
 	}
 
-	StartSoundShader( chat_snd, SND_CHANNEL_VOICE, 0, false, NULL );
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		StartSoundShader( chat_snd, SND_CHANNEL_VOICE, 0, true, NULL ); //broadcast in coop
+	} else {
+		StartSoundShader( chat_snd, SND_CHANNEL_VOICE, 0, false, NULL );
+	}
 
 	// set the next chat time
 	chat_time = gameLocal.time + chat_min + gameLocal.random.RandomFloat() * ( chat_max - chat_min );
@@ -5132,6 +5469,936 @@ bool idAI::UpdateAnimationControllers( void ) {
 
 	return true;
 }
+
+
+/*************************************************
+AI COOP Stuff
+*************************************************/
+
+/*
+================
+idAI::ClientPredictionThink
+================
+*/
+void idAI::ClientPredictionThink( void ) {
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		return idEntity::ClientPredictionThink(); //original non-coop
+	}
+
+	if (g_fastMonsters.GetBool() && allowFastMonsters && team == 1) {
+		if (gameLocal.inCinematic) {
+			animator.UpdateFrameRateMultiplier(1.0f);
+		}
+		else {
+			animator.UpdateFrameRateMultiplier(FM_SPEED_MULTIPLIER);
+		}
+	}
+
+	if (gameLocal.isNewFrame && g_clientsideDamage.GetBool()) {
+		if (clientsideDamageInflicted > 0) {
+			idBitMsg	msg;
+			byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+			msg.Init( msgBuf, sizeof( msgBuf ) );
+			msg.BeginWriting();
+			msg.WriteBits( gameLocal.localClientNum, idMath::BitsForInteger(MAX_CLIENTS) );
+			msg.WriteShort(clientsideDamageInflicted);
+			msg.WriteShort(clientsideDamageLocation);
+			msg.WriteFloat( clientsideDamageDir.x );
+			msg.WriteFloat( clientsideDamageDir.y );
+			msg.WriteFloat( clientsideDamageDir.z );
+			ClientSendEvent( EVENT_CLIENTDAMAGE, &msg );
+			nextTimeHealthReaded = gameLocal.clientsideTime + 1000;
+		}
+		clientsideDamageInflicted = 0;
+	}
+
+	if ( thinkFlags & TH_PHYSICS ) { //edited
+
+		idActor *enemyEnt = enemy.GetEntity();
+		if ( enemyEnt ) {
+			thereWasEnemy = true;
+			if ( enemyEnt->health <= 0 ) {
+				EnemyDead();
+			}
+		} else if (gameLocal.mpGame.IsGametypeCoopBased() && thereWasEnemy) { //COOP: probably a player disconnected from server
+			ClearEnemy();
+		}
+
+		current_yaw += deltaViewAngles.yaw;
+		ideal_yaw = idMath::AngleNormalize180( ideal_yaw + deltaViewAngles.yaw );
+		deltaViewAngles.Zero();
+		viewAxis = idAngles( 0, current_yaw, 0 ).ToMat3();
+
+		if ( num_cinematics ) {
+			RunPhysics();
+		} else if ( !allowHiddenMovement && IsHidden() ) {
+			// hidden monsters
+			//UpdateAIScript();
+		} else {
+			// clear the ik before we do anything else so the skeleton doesn't get updated twice
+			walkIK.ClearJointMods();
+
+			switch( move.moveType ) {
+			case MOVETYPE_DEAD :
+				// dead monsters
+				DeadMove();
+				break;
+
+			case MOVETYPE_FLY :
+				// flying monsters
+				FlyMove();
+				break;
+
+			case MOVETYPE_STATIC :
+				// static monsters
+				StaticMove();
+				break;
+
+			case MOVETYPE_ANIM :
+				// animation based movement
+				CSAnimMove();
+				break;
+
+			case MOVETYPE_SLIDE :
+				// velocity based movement
+				SlideMove();
+				break;
+			}
+		}
+
+		AI_PAIN = false;
+		AI_SPECIAL_DAMAGE = 0;
+		AI_PUSHED = false;
+	}
+
+	//else if ( thinkFlags & TH_PHYSICS ) {
+	//	RunPhysics();
+	//}
+
+	UpdateMuzzleFlash();
+	UpdateAnimation();
+	UpdateParticles();
+	Present();
+	UpdateDamageEffects();
+	LinkCombat();
+}
+
+/*
+================
+ idAI::WriteAnimToSnapshot
+================
+*/
+
+void  idAI::WriteAnimToSnapshot(idBitMsgDelta& msg) const {
+	msg.WriteFloat(anim_turn_yaw);
+	msg.WriteFloat(anim_turn_amount);
+	msg.WriteFloat(anim_turn_angles);
+	msg.WriteShort(currentAnimType);
+	msg.WriteShort(currentTorsoAnim);
+	msg.WriteShort(currentLegsAnim);
+	msg.WriteBits(animator.GetAllowFrameCommands(ANIMCHANNEL_TORSO), 1);
+	msg.WriteBits(animator.GetAllowFrameCommands(ANIMCHANNEL_LEGS), 1);
+}
+
+/*
+================
+ idAI::ReadAnimFromSnapshot
+================
+*/
+
+void idAI::ReadAnimFromSnapshot(const idBitMsgDelta& msg) {
+	anim_turn_yaw = msg.ReadFloat();
+	anim_turn_amount = msg.ReadFloat();
+	anim_turn_angles = msg.ReadFloat();
+	snapshotAnimType = msg.ReadShort();
+	snapshotTorsoAnim = msg.ReadShort();
+	snapshotLegsAnim = msg.ReadShort();
+	animator.SetAllowFrameCommands(ANIMCHANNEL_TORSO, (msg.ReadBits(1) != 0));
+	animator.SetAllowFrameCommands(ANIMCHANNEL_LEGS, (msg.ReadBits(1) != 0));
+}
+
+
+/*
+================
+ idAI::WriteToSnapshot
+================
+*/
+void idAI::WriteToSnapshot( idBitMsgDelta &msg ) const {
+
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		return idEntity::WriteToSnapshot(msg); //original non-coop 
+	}
+
+	idVec3 moveDirVec = vec3_zero;
+	idVec3 normalizedLastDamageDir = vec3_zero;
+
+	if ( (move.moveDir.LengthSqr() - 1.0f) < 0.01f) //Avoid crash
+	{
+		moveDirVec = move.moveDir;
+	}
+	if ( (lastDamageDir.LengthSqr() - 1.0f) < 0.01f) //Avoid crash
+	{
+		normalizedLastDamageDir = lastDamageDir;
+	}
+
+	msg.WriteBits( forceSnapshotUpdateOrigin, 1 );
+	if (forceSnapshotUpdateOrigin) {
+		//sending origin position
+		msg.WriteFloat(GetPhysics()->GetOrigin().x);
+		msg.WriteFloat(GetPhysics()->GetOrigin().y);
+		msg.WriteFloat(GetPhysics()->GetOrigin().z);
+	}
+
+	WriteHiddenToSnapshot( msg );
+	physicsObj.WriteToSnapshot( msg );
+	WriteBindToSnapshot( msg );
+	WriteAnimToSnapshot( msg );
+
+	msg.WriteDeltaFloat( 0.0f, deltaViewAngles[0] );
+	msg.WriteDeltaFloat( 0.0f, deltaViewAngles[1] );
+	msg.WriteDeltaFloat( 0.0f, deltaViewAngles[2] );
+	msg.WriteDeltaFloat( 0.0f , deltaViewAngles.yaw);
+	msg.WriteShort( health );
+	msg.WriteBits( move.moveType, idMath::BitsForInteger(NUM_MOVETYPES)); 
+	msg.WriteBits( move.moveCommand, idMath::BitsForInteger(NUM_MOVE_COMMANDS)); 
+	msg.WriteBits( move.moveStatus, idMath::BitsForInteger(NUM_MOVE_STATUS));
+	msg.WriteInt( move.startTime );
+	msg.WriteFloat( move.speed );
+	msg.WriteFloat(move.moveDest.x);
+	msg.WriteFloat(move.moveDest.y);
+	msg.WriteFloat(move.moveDest.z);
+
+	msg.WriteDir( moveDirVec, 9 );
+	msg.WriteShort(move.anim);
+	msg.WriteFloat(current_yaw);
+	msg.WriteFloat(ideal_yaw);
+	msg.WriteByte(currentNetAction);
+	
+	msg.WriteFloat(turnTowardPos.x);
+	msg.WriteFloat(turnTowardPos.y);
+	msg.WriteFloat(turnTowardPos.z);
+
+	int enemyEntityNum = enemy.GetEntity() ? enemy.GetEntity()->entityCoopNumber : -1;
+	int goalEntityNum = move.goalEntity.GetEntity() ? move.goalEntity.GetEntity()->entityCoopNumber : -1;
+
+	msg.WriteInt( enemyEntityNum );
+	msg.WriteInt( goalEntityNum );
+
+	msg.WriteShort( currentChannelOverride );
+	msg.WriteBits( disableGravity, 1 );
+
+	msg.WriteBits(gameLocal.inCinematic, 1);
+	if (gameLocal.inCinematic) {
+		msg.WriteShort(current_cinematic);
+	}
+
+	msg.WriteBits( fl.takedamage, 1 );
+	//renderEntity FX
+	msg.WriteBits( renderEntity.noShadow, 1);
+	msg.WriteFloat(renderEntity.shaderParms[SHADERPARM_TIME_OF_DEATH]);
+
+	if (currentAttackDefNum != -1) {
+		msg.WriteBits(true, 1);
+		msg.WriteBits( gameLocal.ServerRemapDecl( -1, DECL_ENTITYDEF, currentAttackDefNum ), gameLocal.entityDefBits );
+	} else {
+		msg.WriteBits(false, 1);
+	}
+
+	//Head entity info
+	int headEntitySendInfo = head.GetEntity() ? 1 : 0;
+	msg.WriteBits( headEntitySendInfo, 1 );
+	if (headEntitySendInfo) {
+		msg.WriteShort(currentHeadAnim);
+		msg.WriteBits(head.GetEntity()->GetAnimator()->GetAllowFrameCommands(ANIMCHANNEL_ALL), 1);
+		int focusEntityNum = focusEntity.GetEntity() ? focusEntity.GetEntity()->entityCoopNumber : -1;
+		msg.WriteInt( focusEntityNum );
+		msg.WriteInt( alignHeadTime );
+		msg.WriteInt( forceAlignHeadTime );
+		msg.WriteInt( blink_time );
+		msg.WriteInt( focusTime );
+	}
+}
+
+/*
+================
+ idAI::ReadFromSnapshot
+================
+*/
+void idAI::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+		return idEntity::ReadFromSnapshot(msg); //original non-coop 
+	}
+
+	int		i, oldHealth, enemySpawnId, headAnimId, enemyEntityId, goalEntityId, focusEntityId, oldCurrentDefAttack;
+	bool	newHitToggle, stateHitch, hasEnemy, getOriginInfo, headEntityReceivedInfo;
+	bool	snapshotInCinematic, headAllowCommandsFrame;
+
+	headAnimId = 0;
+
+	netActionType_t newNetAction;
+	idVec3	tmpOrigin = vec3_zero;
+
+	oldCurrentDefAttack = currentAttackDefNum;
+	oldHealth = health;
+
+	getOriginInfo  = msg.ReadBits( 1 ) != 0;
+	if (getOriginInfo) {
+		//receiving origin position
+		tmpOrigin.x = msg.ReadFloat();
+		tmpOrigin.y = msg.ReadFloat();
+		tmpOrigin.z = msg.ReadFloat();
+	}
+
+	ReadHiddenFromSnapshot(msg);
+	physicsObj.ReadFromSnapshot( msg );
+	ReadBindFromSnapshot( msg );
+	ReadAnimFromSnapshot( msg );
+
+	deltaViewAngles[0] = msg.ReadDeltaFloat( 0.0f );
+	deltaViewAngles[1] = msg.ReadDeltaFloat( 0.0f );
+	deltaViewAngles[2] = msg.ReadDeltaFloat( 0.0f );
+	deltaViewAngles.yaw = msg.ReadDeltaFloat( 0.0f );
+	health = msg.ReadShort();
+	move.moveType = static_cast<moveType_t>(msg.ReadBits(idMath::BitsForInteger(NUM_MOVETYPES)));
+	move.moveCommand = static_cast<moveCommand_t>(msg.ReadBits(idMath::BitsForInteger(NUM_MOVE_COMMANDS)));
+	move.moveStatus = static_cast<moveStatus_t>(msg.ReadBits(idMath::BitsForInteger(NUM_MOVE_STATUS)));
+	move.startTime = msg.ReadInt();
+	move.speed = msg.ReadFloat();
+	move.moveDest.x = msg.ReadFloat();
+	move.moveDest.y = msg.ReadFloat();
+	move.moveDest.z = msg.ReadFloat();
+	move.moveDir = msg.ReadDir( 9 );
+	move.anim = msg.ReadShort();
+	current_yaw = msg.ReadFloat();
+	ideal_yaw = msg.ReadFloat();
+	newNetAction = static_cast<netActionType_t>(msg.ReadByte());
+
+	turnTowardPos.x= msg.ReadFloat();
+	turnTowardPos.y= msg.ReadFloat();
+	turnTowardPos.z= msg.ReadFloat();
+
+	lastVisibleEnemyPos = turnTowardPos; //DELETE ME LATER
+
+	enemyEntityId = msg.ReadInt();
+	goalEntityId =  msg.ReadInt();
+
+	if (enemyEntityId >= 0 && gameLocal.coopentities[enemyEntityId] && gameLocal.coopentities[enemyEntityId]->IsType(idActor::Type)) {
+		enemy = static_cast<idActor*>(gameLocal.coopentities[enemyEntityId]);
+	}
+	if (goalEntityId >= 0 && gameLocal.coopentities[goalEntityId]) {
+		move.goalEntity = gameLocal.coopentities[goalEntityId];
+	}
+
+	currentChannelOverride = msg.ReadShort();
+
+	disableGravity = msg.ReadBits( 1 ) != 0;
+
+	snapshotInCinematic = msg.ReadBits( 1 ) != 0;
+
+	if (snapshotInCinematic) {
+		current_cinematic = msg.ReadShort();
+	}
+
+	fl.takedamage = msg.ReadBits( 1 ) != 0;
+
+	//fx
+	renderEntity.noShadow = msg.ReadBits(1) != 0;
+	renderEntity.shaderParms[SHADERPARM_TIME_OF_DEATH] = msg.ReadFloat();
+	if ( msg.ReadBits( 1 ) ) {
+		currentAttackDefNum = gameLocal.ClientRemapDecl( DECL_ENTITYDEF, msg.ReadBits( gameLocal.entityDefBits ) );
+	} else {
+		currentAttackDefNum = -1;
+	}
+
+	//Head entity info
+	headEntityReceivedInfo = msg.ReadBits( 1 ) != 0;
+	if (headEntityReceivedInfo) {
+		headAnimId = msg.ReadShort();
+		headAllowCommandsFrame = msg.ReadBits(1);
+		focusEntityId = msg.ReadInt();
+		if (focusEntityId >= 0 && gameLocal.coopentities[focusEntityId]) {
+			focusEntity = gameLocal.coopentities[focusEntityId];
+		}
+		alignHeadTime =  msg.ReadInt();
+		forceAlignHeadTime = msg.ReadInt();
+		blink_time = msg.ReadInt();
+		focusTime = msg.ReadInt();
+	}
+
+	//No more msg read from here 
+
+	if (g_clientsideDamage.GetBool() && nextTimeHealthReaded > gameLocal.clientsideTime && health > oldHealth) { //In case server is trying to override our recent clientside damage. Could be a problem for enemies with regeneration
+		health = oldHealth; //avoid bug with g_clientsideDamage 1
+	}
+
+	if (oldCurrentDefAttack != currentAttackDefNum) {
+		const idDeclEntityDef *tmpDef;
+		//ugly avoid crash in coop
+		int declTypeCount = declManager->GetNumDecls(DECL_ENTITYDEF);
+		if (currentAttackDefNum < 0 || currentAttackDefNum >= declTypeCount) {
+			tmpDef = NULL;
+		} else {
+			tmpDef = static_cast<const idDeclEntityDef *>( declManager->DeclByIndex( DECL_ENTITYDEF, currentAttackDefNum, false ) );
+		}
+		//avoid crash in coop
+		if ( tmpDef ) {
+			BeginAttack(tmpDef->GetName());
+		} else {
+			EndAttack();
+		}
+
+	}
+
+	if (!snapshotInCinematic || !num_cinematics) {
+
+		if (oldHealth <= 0 && health > 0) { //Resurrected
+			if (g_clientsideDamage.GetBool()) {
+				idBitMsg	msg;
+				byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+
+				msg.Init(msgBuf, sizeof(msgBuf));
+				msg.BeginWriting();
+				msg.WriteBits(gameLocal.localClientNum, idMath::BitsForInteger(MAX_CLIENTS));
+				msg.WriteShort(clientsideDamageLocation);
+				msg.WriteFloat(clientsideDamageDir.x);
+				msg.WriteFloat(clientsideDamageDir.y);
+				msg.WriteFloat(clientsideDamageDir.z);
+				ClientSendEvent(EVENT_CLIENTKILL, NULL); //Server probably didn't receive he message, try again!
+				health = 0;
+				nextTimeHealthReaded = gameLocal.clientsideTime + 1000;
+			}
+			else {
+				CSResurrected();
+			}
+		}
+		else if (oldHealth > 0 && health <= 0) {
+			CSKilled();
+		}
+		else if (health < oldHealth && health > 0) {
+			//pain
+			//AI_PAIN = Pain( NULL, NULL, oldHealth - health, lastDamageDir, lastDamageLocation ); //causing crash.
+		}
+		if (oldHealth <= 0) {
+			UpdateVisuals();
+			return; //Don't play animations in dead bodies in case the server didn't receive the death info yet!
+		}
+
+		CSProcessAnimations(snapshotTorsoAnim, headAnimId, snapshotLegsAnim, snapshotAnimType, snapshotInCinematic);
+
+		if (headEntityReceivedInfo && head.GetEntity() && currentHeadAnim != headAnimId) {
+			head.GetEntity()->GetAnimator()->SetAllowFrameCommands(ANIMCHANNEL_ALL, headAllowCommandsFrame); 
+		}
+
+	} else {
+
+		CSProcessAnimations(snapshotTorsoAnim, headAnimId, snapshotLegsAnim, snapshotAnimType, snapshotInCinematic);
+
+		if (headEntityReceivedInfo && head.GetEntity() && currentHeadAnim != headAnimId) {
+			head.GetEntity()->GetAnimator()->SetAllowFrameCommands(ANIMCHANNEL_ALL, headAllowCommandsFrame); 
+		}
+	}
+
+	if ( msg.HasChanged() ) {
+		if (getOriginInfo) { //lets update origin then
+			physicsObj.SetOrigin( tmpOrigin + idVec3( 0, 0, CM_CLIP_EPSILON ) );
+		}
+		ClientProcessNetAction(newNetAction);
+		UpdateVisuals();
+	}
+}
+
+/*
+================
+ idAI::ServerReceiveEvent
+================
+*/
+bool  idAI::ServerReceiveEvent( int event, int time, const idBitMsg &msg ) {
+
+	// client->server events
+	switch( event ) {
+		case EVENT_CLIENTKILL: {
+			int clientEntityNum, damageToInflict, location;
+			bool gibEntity=false;
+			idVec3 tmpDir = vec3_zero;
+
+			clientEntityNum = msg.ReadBits(idMath::BitsForInteger(MAX_CLIENTS));
+			location = msg.ReadShort();
+			tmpDir.x = msg.ReadFloat();
+			tmpDir.y = msg.ReadFloat();
+			tmpDir.z = msg.ReadFloat();
+			if (this->health > 0) {
+				if (spawnArgs.GetBool( "gib" )) { //instant gib in coop
+					gibEntity = true;
+				}
+				this->health = 0;
+			}
+
+			if (clientEntityNum >= 0 && clientEntityNum < MAX_CLIENTS && gameLocal.entities[clientEntityNum] && gameLocal.entities[clientEntityNum]->IsType(idPlayer::Type)) {
+				lastPlayerDamage = gameLocal.entities[clientEntityNum];
+			}
+
+			Killed( NULL, lastPlayerDamage, 1, tmpDir, location );
+			if (gibEntity) {
+				Gib( tmpDir, NULL );
+			}
+		}
+	}
+
+	return idActor::ServerReceiveEvent( event, time, msg );
+}
+
+/*
+================
+idAI::ClientReceiveEvent
+================
+*/
+bool  idAI::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
+
+	int damageDefIndex;
+	int materialIndex;
+	jointHandle_t jointNum;
+	idVec3 localOrigin, localNormal, localDir;
+
+	switch( event ) {
+		case EVENT_RESURRECTED: {
+			health = msg.ReadShort();
+			CSResurrected();
+			return true;
+		}
+		case EVENT_ADD_DAMAGE_EFFECT: {
+			jointNum = (jointHandle_t) msg.ReadShort();
+			localOrigin[0] = msg.ReadFloat();
+			localOrigin[1] = msg.ReadFloat();
+			localOrigin[2] = msg.ReadFloat();
+			localNormal = msg.ReadDir( 24 );
+			localDir = msg.ReadDir( 24 );
+			damageDefIndex = gameLocal.ClientRemapDecl( DECL_ENTITYDEF, msg.ReadInt() );
+			materialIndex = gameLocal.ClientRemapDecl( DECL_MATERIAL, msg.ReadInt() );
+
+			//AI_DEAD && haveModelDeath is important cause avoid crash while trying to send a damage effect to an already dead AI with a model_death (lost soul)
+			if ((damageDefIndex == -1 || materialIndex  == -1 || (AI_DEAD && haveModelDeath)) && gameLocal.mpGame.IsGametypeCoopBased()){ //ugly avoid crash in coop
+				return true;
+			}
+
+			//ugly avoid crash in coop
+			int declTypeCount = declManager->GetNumDecls(DECL_ENTITYDEF);
+			if (damageDefIndex < 0 || damageDefIndex >= declTypeCount) {
+				common->DWarning("[COOP] index declType out of range at idAI::ClientReceiveEvent\n");
+				return true;
+			}
+			declTypeCount = declManager->GetNumDecls(DECL_MATERIAL);
+			if (materialIndex < 0 || materialIndex >= declTypeCount) {
+				common->DWarning("[COOP] index declType out of range at idAI::ClientReceiveEvent\n");
+				return true;
+			}
+			//avoid crash in coop
+
+			const idDeclEntityDef *damageDef = static_cast<const idDeclEntityDef *>( declManager->DeclByIndex( DECL_ENTITYDEF, damageDefIndex ) );
+			const idMaterial *collisionMaterial = static_cast<const idMaterial *>( declManager->DeclByIndex( DECL_MATERIAL, materialIndex ) );
+			AddLocalDamageEffect( jointNum, localOrigin, localNormal, localDir, damageDef, collisionMaterial );
+			return true;
+		}
+		default:
+			break;
+	}
+
+	return idActor::ClientReceiveEvent( event, time, msg );
+}
+/*
+================
+idAI::ClientProcessNetAction
+================
+*/
+
+void idAI::ClientProcessNetAction(netActionType_t newAction) {
+
+	if (newAction == currentNetAction) {
+		return; //no changes
+	}
+	currentNetAction = newAction;
+	switch (currentNetAction) {
+		case NETACTION_NONE:
+			//Nothing
+		break;
+		case NETACTION_SHOW:
+			Show();
+		break;
+		case NETACTION_HIDE:
+			Hide();
+		break;
+		case NETACTION_OVERRIDEANIM:
+			Event_OverrideAnim(currentChannelOverride);
+		break;
+	}
+		
+
+	return;
+}
+
+/*
+================
+idAI::GetClosestPlayerEnemy
+================
+*/
+
+idPlayer *idAI::GetClosestPlayerEnemy( void ) {
+	idPlayer* closestPlayer = NULL;
+	float shortestDist = idMath::INFINITY;
+	idPlayer *player;
+	float dist;
+	idVec3		delta;
+	for (int i = 0; i < gameLocal.numClients; i++) {
+		player = gameLocal.GetClientByNum(i);
+
+		if (!player || player->spectating || player->health <= 0 || !(ReactionTo(player) & ATTACK_ON_SIGHT)) {
+			continue;
+		}
+
+		delta = physicsObj.GetOrigin() - player->GetPhysics()->GetOrigin();
+		dist = delta.LengthSqr();
+
+		if (dist < shortestDist) {
+			shortestDist = dist;
+			closestPlayer = player;
+		}
+	}
+
+	return closestPlayer;
+}
+
+/*
+================
+idAI::GetClosestPlayer
+================
+*/
+
+idPlayer *idAI::GetClosestPlayer( void ) {
+	idPlayer* closestPlayer = NULL;
+	float shortestDist = idMath::INFINITY;
+	idPlayer *player;
+	float dist;
+	idVec3		delta;
+	for (int i = 0; i < gameLocal.numClients; i++) {
+		player = gameLocal.GetClientByNum(i);
+
+		if (!player || player->spectating || player->health <= 0) {
+			continue;
+		}
+
+		delta = physicsObj.GetOrigin() - player->GetPhysics()->GetOrigin();
+		dist = delta.LengthSqr();
+
+		if (dist < shortestDist) {
+			shortestDist = dist;
+			closestPlayer = player;
+		}
+	}
+
+	return closestPlayer;
+}
+//focusCharacter
+
+/*
+================
+idAI::GetClosestPlayer
+================
+*/
+
+idPlayer *idAI::GetFocusPlayer( void ) {
+	idPlayer *player;
+	for (int i = 0; i < gameLocal.numClients; i++) {
+		player = gameLocal.GetClientByNum(i);
+		if (!player || player->spectating || player->health <= 0) {
+			continue;
+		}
+		if (player->GetFocusCharacter() == this)
+			return player;
+	}
+
+	return NULL;
+}
+
+/*
+=======================
+idAI::CSProcessAnimations
+======================
+*/
+
+void idAI::CSProcessAnimations(int newTorsoAnimId, int newHeadAnimId, int newLegsAnimId, int newAnimType, bool cinematic) {
+
+	if (newTorsoAnimId != currentTorsoAnim || currentAnimType != newAnimType) {
+		switch (newAnimType) {
+		case idActor::ACTOR_ANIM_CYCLE:
+			//PlayCycleID(ANIMCHANNEL_TORSO, newTorsoAnimId);
+			torsoAnim.idleAnim = false;
+			animator.CycleAnim(ANIMCHANNEL_TORSO, newTorsoAnimId, gameLocal.time, 2); //FIXME, this is not the right way to sync this!
+			break;
+
+		case idActor::ACTOR_ANIM_PLAY:
+			if (cinematic) {
+				PlayAnimID(ANIMCHANNEL_TORSO, newTorsoAnimId);
+			}
+			else {
+				//PlayCycleID(ANIMCHANNEL_TORSO, newTorsoAnimId);
+				torsoAnim.idleAnim = false;
+				animator.CycleAnim(ANIMCHANNEL_TORSO, newTorsoAnimId, gameLocal.time, 2); //FIXME, this is not the right way to sync this!
+			}
+			break;
+		case idActor::ACTOR_ANIM_IDLE:
+			if (cinematic) {
+				PlayIdleID(ANIMCHANNEL_TORSO, newTorsoAnimId);
+			}
+			else {
+				//PlayCycleID(ANIMCHANNEL_TORSO, newTorsoAnimId);
+				torsoAnim.idleAnim = false;
+				animator.CycleAnim(ANIMCHANNEL_TORSO, newTorsoAnimId, gameLocal.time, 2); //FIXME, this is not the right way to sync this!
+			}
+
+		}
+	}
+
+	if (newLegsAnimId != currentLegsAnim || currentAnimType != newAnimType) {
+		switch (newAnimType) {
+		case idActor::ACTOR_ANIM_CYCLE:
+			//PlayCycleID(ANIMCHANNEL_LEGS, newLegsAnimId);
+			legsAnim.idleAnim = false;
+			animator.CycleAnim(ANIMCHANNEL_LEGS, newLegsAnimId, gameLocal.time, 2); //FIXME, this is not the right way to sync this!
+			break;
+
+		case idActor::ACTOR_ANIM_PLAY:
+			if (cinematic) {
+				PlayAnimID(ANIMCHANNEL_LEGS, newLegsAnimId);
+			}
+			else {
+				//PlayCycleID(ANIMCHANNEL_LEGS, newLegsAnimId);
+				legsAnim.idleAnim = false;
+				animator.CycleAnim(ANIMCHANNEL_LEGS, newLegsAnimId, gameLocal.time, 2); //FIXME, this is not the right way to sync this!
+			}
+			break;
+		case idActor::ACTOR_ANIM_IDLE:
+			if (cinematic) {
+				PlayIdleID(ANIMCHANNEL_LEGS, newLegsAnimId);
+			}
+			else {
+				//PlayCycleID(ANIMCHANNEL_LEGS, newLegsAnimId);
+				legsAnim.idleAnim = false;
+				animator.CycleAnim(ANIMCHANNEL_LEGS, newLegsAnimId, gameLocal.time, 2); //FIXME, this is not the right way to sync this!
+			}
+		}
+	}
+
+	//FIXME, this is not the right way to sync this!
+	if (head.GetEntity() && currentHeadAnim != newHeadAnimId) {
+		if (cinematic) {
+			head.GetEntity()->GetAnimator()->PlayAnim(ANIMCHANNEL_ALL, newHeadAnimId, gameLocal.time, 2);
+		}
+		else {
+			head.GetEntity()->GetAnimator()->CycleAnim(ANIMCHANNEL_ALL, newHeadAnimId, gameLocal.time, 2);
+		}
+
+	}
+
+	currentTorsoAnim = newTorsoAnimId;
+	currentLegsAnim = newLegsAnimId;
+	currentAnimType = newAnimType;
+	currentHeadAnim = newHeadAnimId;
+}
+
+/*
+=======================
+idAI::CSAnimMove
+======================
+*/
+
+void idAI::CSAnimMove( void ) {
+
+	idVec3				goalPos;
+	idVec3				delta;
+	idVec3				goalDelta;
+	float				goalDist;
+	idVec3				newDest;
+
+	idVec3 oldorigin = physicsObj.GetOrigin();
+	idMat3 oldaxis = viewAxis;
+
+	AI_BLOCKED = false;
+
+	if ( move.moveCommand < NUM_NONMOVING_COMMANDS ){
+		move.lastMoveOrigin.Zero();
+		move.lastMoveTime = gameLocal.time;
+	}
+
+	move.obstacle = NULL;
+	if ( (move.moveCommand == MOVE_FACE_ENEMY) && enemy.GetEntity()  ) { 
+		TurnToward( turnTowardPos );
+		goalPos = oldorigin;
+	} else if ( (move.moveCommand == MOVE_FACE_ENTITY) && move.goalEntity.GetEntity()) { //Clients don't know the enemy entity COOP
+		TurnToward( turnTowardPos );
+		goalPos = oldorigin;
+	} else if ( GetMovePos( goalPos ) ) {
+		TurnToward( turnTowardPos ); //no need for CheckObstacleAvoidance in coop
+	}
+
+	Turn();
+
+	if ( move.moveCommand == MOVE_SLIDE_TO_POSITION ) {
+		if ( gameLocal.time < move.startTime + move.duration ) {
+			goalPos = move.moveDest - move.moveDir * MS2SEC( move.startTime + move.duration - gameLocal.time );
+			delta = goalPos - oldorigin;
+			delta.z = 0.0f;
+		} else {
+			delta = move.moveDest - oldorigin;
+			delta.z = 0.0f;
+			StopMove( MOVE_STATUS_DONE );
+		}
+	} else if ( allowMove ) {
+		GetMoveDelta( oldaxis, viewAxis, delta );
+	} else {
+		delta.Zero();
+	}
+
+	if ( move.moveCommand == MOVE_TO_POSITION ) {
+		goalDelta = move.moveDest - oldorigin;
+		goalDist = goalDelta.LengthFast();
+		if ( goalDist < delta.LengthFast() ) {
+			delta = goalDelta;
+		}
+	}
+
+	physicsObj.SetDelta( delta );
+	physicsObj.ForceDeltaMove( disableGravity );
+
+	RunPhysics();
+
+	if ( ai_debugMove.GetBool() ) {
+		gameRenderWorld->DebugLine( colorCyan, oldorigin, physicsObj.GetOrigin(), 5000 );
+	}
+
+	if ( !af_push_moveables && attack.Length() && TestMelee() ) {
+		DirectDamage( attack, enemy.GetEntity(), true ); 
+	} else {
+		idEntity *blockEnt = physicsObj.GetSlideMoveEntity();
+		if ( blockEnt && blockEnt->IsType( idMoveable::Type ) && blockEnt->GetPhysics()->IsPushable() ) {
+			KickObstacles( viewAxis[ 0 ], kickForce, blockEnt );
+		}
+	}
+
+	BlockedFailSafe();
+
+	AI_ONGROUND = physicsObj.OnGround();
+
+	
+	idVec3 org = physicsObj.GetOrigin();
+
+	if ( oldorigin != org ) {
+		ClientTouchTriggers(); //client-side triggers only
+	}
+	
+
+	if ( ai_debugMove.GetBool() ) {
+		gameRenderWorld->DebugBounds( colorMagenta, physicsObj.GetBounds(), org, gameLocal.msec );
+		gameRenderWorld->DebugBounds( colorMagenta, physicsObj.GetBounds(), move.moveDest, gameLocal.msec );
+		gameRenderWorld->DebugLine( colorYellow, org + EyeOffset(), org + EyeOffset() + viewAxis[ 0 ] * physicsObj.GetGravityAxis() * 16.0f, gameLocal.msec, true );
+		DrawRoute();
+	}
+	
+}
+
+/*
+=====================
+idAI::CSKilled
+COOP: Behaviour when killed clientside
+=====================
+*/
+void idAI::CSKilled( void ) {
+
+	forceNetworkSync = false;
+
+	idAngles ang;
+	const char *modelDeath;
+
+	// stop all voice sounds
+	StopSound( SND_CHANNEL_VOICE, false );
+	if ( head.GetEntity() ) {
+		head.GetEntity()->StopSound( SND_CHANNEL_VOICE, false );
+		head.GetEntity()->GetAnimator()->ClearAllAnims( gameLocal.time, 100 );
+	}
+
+	disableGravity = false;
+	move.moveType = MOVETYPE_DEAD;
+	af_push_moveables = false;
+
+	physicsObj.UseFlyMove( false );
+	physicsObj.ForceDeltaMove( false );
+
+	// end our looping ambient sound
+	StopSound( SND_CHANNEL_AMBIENT, false );
+
+	//RemoveAttachments(); //fix this later
+	RemoveProjectile();
+
+	StopMove( MOVE_STATUS_DONE );
+
+	AI_DEAD = true;
+	// make monster nonsolid
+	physicsObj.SetContents( 0 );
+	physicsObj.GetClipModel()->Unlink();
+
+	Unbind();
+
+	if ( StartRagdoll() ) {
+		StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL );
+	}
+
+	if ( spawnArgs.GetString( "model_death", "", &modelDeath ) ) {
+		StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL );
+		renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] = -MS2SEC( gameLocal.time );
+		SetModel( modelDeath );
+		physicsObj.SetLinearVelocity( vec3_zero );
+		physicsObj.PutToRest();
+		physicsObj.DisableImpact();
+	}
+
+	restartParticles = false;
+
+	SetWaitState( "" );
+	animator.ClearAllJoints(); //should this happen?
+}
+
+/*
+=====================
+idAI::CSResurrected
+COOP: Behaviour when resurrected clientside
+=====================
+*/
+void idAI::CSResurrected( void ) {
+	gameLocal.DebugPrintf("%s was resurrected\n", this->GetName());
+	StopMove( MOVE_STATUS_DONE );
+	Hide();
+	StopRagdoll();
+	SetPhysics( &physicsObj );
+	AI_DEAD = false;
+	forceNetworkSync = true;
+}
+
+/*
+===============
+idAI::Event_OverrideAnim
+===============
+*/
+void idAI::Event_OverrideAnim( int channel ) {
+	if (gameLocal.isServer) {
+		currentChannelOverride = channel;
+		currentNetAction = NETACTION_OVERRIDEANIM;
+	}
+
+	idActor::Event_OverrideAnim(channel);
+
+	return;
+}
+
+
 
 /***********************************************************************
 

@@ -51,6 +51,8 @@ public:
 
 	void				Spawn( void );
 
+	virtual void			WriteToSnapshot(idBitMsgDelta& msg) const; //added for COOP
+	virtual void			ReadFromSnapshot(const idBitMsgDelta& msg); //added for COOP
 private:
 };
 
@@ -81,6 +83,8 @@ public:
 
 	void				Save( idSaveGame *savefile ) const;
 	void				Restore( idRestoreGame *savefile );
+	void				Event_Enable( void ); //added for OpenCoop maps Compability
+	void				Event_Disable( void ); //added for OpenCoop maps Compability
 
 	virtual bool		ClientReceiveEvent( int event, int time, const idBitMsg &msg );
 
@@ -191,7 +195,17 @@ class idExplodable : public idEntity {
 public:
 	CLASS_PROTOTYPE( idExplodable );
 
+	//Nicemice: OpenCoop
+	enum {
+		EVENT_EXPLODE = idEntity::EVENT_MAXEVENTS,
+		EVENT_MAXEVENTS
+	};
+
+
 	void				Spawn( void );
+
+	// Nicemice: Lets receive events
+	virtual bool		ClientReceiveEvent(int event, int time, const idBitMsg& msg);
 
 private:
 	void				Event_Explode( idEntity *activator );
@@ -280,9 +294,16 @@ public:
 	bool					StartRagdoll( void );
 	virtual bool			GetPhysicsToSoundTransform( idVec3 &origin, idMat3 &axis );
 
+	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const; //added for COOP
+	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg ); //added for COOP
+	virtual void			ClientPredictionThink( void ); //added for COOP
+	virtual void			Think( void ); //added for COOP
+
 private:
 	int						num_anims;
 	int						current_anim_index;
+	int						currentAnimPlaying; //for coop
+	bool					hasBeenActivated; //added for Coop
 	int						anim;
 	int						blendFrames;
 	jointHandle_t			soundJoint;
@@ -329,11 +350,26 @@ public:
 	void				Fade( const idVec4 &to, float fadeTime );
 	virtual void		Think( void );
 
+	//added for coop
+	enum {
+		EVENT_STATIC_ACTIVATE = idEntity::EVENT_MAXEVENTS,
+		EVENT_STATIC_HIDE,
+		EVENT_STATIC_SHOW,
+		EVENT_STATIC_REMOVE,
+		EVENT_MAXEVENTS
+	};
+	//end for coop
+
 	virtual void		WriteToSnapshot( idBitMsgDelta &msg ) const;
 	virtual void		ReadFromSnapshot( const idBitMsgDelta &msg );
+	virtual bool		ClientReceiveEvent( int event, int time, const idBitMsg &msg ); //added for coop
+	virtual void		ClientPredictionThink( void ); //added for COOP
 
 private:
 	void				Event_Activate( idEntity *activator );
+	void				Event_Remove( void ); //added for coop
+	void				Event_Hide( void ); //added for coop
+	void				Event_Show( void ); //added for coop
 
 	int					spawnTime;
 	bool				active;
@@ -373,6 +409,42 @@ private:
 
 };
 
+//added for LM
+
+/*
+===============================================================================
+idFuncShootProjectile
+===============================================================================
+*/
+
+class idFuncShootProjectile : public idStaticEntity {
+public:
+	CLASS_PROTOTYPE( idFuncShootProjectile );
+
+	idFuncShootProjectile();
+
+	void						Save( idSaveGame *savefile ) const;
+	void						Restore( idRestoreGame *savefile );
+
+	void						Spawn();
+	void						Event_Activate( idEntity *activator );
+
+	virtual void				Think();
+
+	virtual void				WriteToSnapshot( idBitMsg &msg ) const;
+	virtual void				ReadFromSnapshot( const idBitMsg &msg );
+
+private:
+	int							mRespawnDelay;
+	int							mRespawnTime;
+	float						mShootSpeed;
+	idVec3						mShootDir;
+	idStr						mEntityDefName;
+	idEntityPtr< idEntity >		mLastProjectile;
+
+};
+
+//end for LM
 
 /*
 ===============================================================================
@@ -465,6 +537,10 @@ public:
 	void				Spawn( void );
 
 	const char *		GetLocation( void ) const;
+	int					GetPlayersIn( void ) const ; //added for OpenCoop maps support
+	void				Event_NumPlayers( void ); //added for OpenCoop maps support
+	void				Event_AllPlayersIn( void ); //added for OpenCoop maps support
+	void				Event_NoPlayersIn( void ); //added for OpenCoop maps support
 
 private:
 };
@@ -531,12 +607,23 @@ public:
 
 	virtual void		Show( void );
 
+	//added for coop
+	enum {
+		EVENT_BEAM_ACTIVATE = idEntity::EVENT_MAXEVENTS,
+		EVENT_BEAM_REMOVE,
+		EVENT_MAXEVENTS
+	};
+	//end for coop
+
+	virtual void		ClientPredictionThink( void ); //added for COOP
 	virtual void		WriteToSnapshot( idBitMsgDelta &msg ) const;
 	virtual void		ReadFromSnapshot( const idBitMsgDelta &msg );
+	virtual bool		ClientReceiveEvent( int event, int time, const idBitMsg &msg ); //added for coop
 
 private:
 	void				Event_MatchTarget( void );
 	void				Event_Activate( idEntity *activator );
+	void				Event_Remove( void ); //added for coop
 
 	idEntityPtr<idBeam>	target;
 	idEntityPtr<idBeam>	master;

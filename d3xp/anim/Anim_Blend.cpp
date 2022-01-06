@@ -772,24 +772,45 @@ void idAnim::CallFrameCommands( idEntity *ent, int from, int to ) const {
 					break;
 				}
 				case FC_SOUND_VOICE: {
+					bool netSyncSound = false;
+					if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isNPC(ent)) {
+						if (gameLocal.isServer) {
+						netSyncSound = true;
+						} else {
+							//don't play any sound because can lead to bug sometimes
+							break;
+						}
+					}
+
 					if ( !command.soundShader ) {
-						if ( !ent->StartSound( command.string->c_str(), SND_CHANNEL_VOICE, 0, false, NULL ) ) {
+						if ( !ent->StartSound( command.string->c_str(), SND_CHANNEL_VOICE, 0, netSyncSound, NULL ) ) {
 							gameLocal.Warning( "Framecommand 'sound_voice' on entity '%s', anim '%s', frame %d: Could not find sound '%s'",
 								ent->name.c_str(), FullName(), frame + 1, command.string->c_str() );
 						}
 					} else {
-						ent->StartSoundShader( command.soundShader, SND_CHANNEL_VOICE, 0, false, NULL );
+						ent->StartSoundShader( command.soundShader, SND_CHANNEL_VOICE, 0, netSyncSound, NULL );
 					}
 					break;
 				}
 				case FC_SOUND_VOICE2: {
+
+					bool netSyncSound = false;
+					if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isNPC(ent)) {
+						if (gameLocal.isServer) {
+							netSyncSound = true;
+						} else {
+							//don't play any sound because can lead to bug sometimes
+							break;
+						}
+					}
+
 					if ( !command.soundShader ) {
-						if ( !ent->StartSound( command.string->c_str(), SND_CHANNEL_VOICE2, 0, false, NULL ) ) {
+						if ( !ent->StartSound( command.string->c_str(), SND_CHANNEL_VOICE2, 0, netSyncSound, NULL ) ) {
 							gameLocal.Warning( "Framecommand 'sound_voice2' on entity '%s', anim '%s', frame %d: Could not find sound '%s'",
 								ent->name.c_str(), FullName(), frame + 1, command.string->c_str() );
 						}
 					} else {
-						ent->StartSoundShader( command.soundShader, SND_CHANNEL_VOICE2, 0, false, NULL );
+						ent->StartSoundShader( command.soundShader, SND_CHANNEL_VOICE2, 0, netSyncSound, NULL );
 					}
 					break;
 				}
@@ -926,6 +947,11 @@ void idAnim::CallFrameCommands( idEntity *ent, int from, int to ) const {
 					break;
 				}
 				case FC_LAUNCHMISSILE: {
+					if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased() && !g_clientsideDamage.GetBool() && ent && ent->IsType(idAI::Type)) { //COOP, to force triggerweaponeffects in clients
+						//fake muzzleflash by force
+						idAI* tmpAI = static_cast<idAI*>(ent);
+						tmpAI->TriggerWeaponEffects(vec3_zero);
+					}
 					ent->ProcessEvent( &AI_AttackMissile, command.string->c_str() );
 					break;
 				}
@@ -1196,6 +1222,7 @@ void idAnimBlend::Reset( const idDeclModelDef *_modelDef ) {
 	allowMove	= true;
 	allowFrameCommands = true;
 	animNum		= 0;
+	frameRateMultiplier = 1.0f;
 
 	memset( animWeights, 0, sizeof( animWeights ) );
 
@@ -1760,7 +1787,7 @@ int idAnimBlend::GetFrameNumber( int currentTime ) const {
 
 	md5anim = anim->MD5Anim( 0 );
 	animTime = AnimTime( currentTime );
-	md5anim->ConvertTimeToFrame( animTime, cycle, frameinfo );
+	md5anim->ConvertTimeToFrame( animTime, cycle, frameinfo, frameRateMultiplier);
 
 	return frameinfo.frame1 + 1;
 }
@@ -1799,8 +1826,8 @@ void idAnimBlend::CallFrameCommands( idEntity *ent, int fromtime, int totime ) c
 	}
 
 	md5anim = anim->MD5Anim( 0 );
-	md5anim->ConvertTimeToFrame( fromFrameTime, cycle, frame1 );
-	md5anim->ConvertTimeToFrame( toFrameTime, cycle, frame2 );
+	md5anim->ConvertTimeToFrame( fromFrameTime, cycle, frame1, frameRateMultiplier);
+	md5anim->ConvertTimeToFrame( toFrameTime, cycle, frame2, frameRateMultiplier);
 
 	if ( fromFrameTime <= 0 ) {
 		// make sure first frame is called
@@ -1861,7 +1888,7 @@ bool idAnimBlend::BlendAnim( int currentTime, int channel, int numJoints, idJoin
 		if ( frame ) {
 			md5anim->GetSingleFrame( frame - 1, jointFrame, modelDef->GetChannelJoints( channel ), modelDef->NumJointsOnChannel( channel ) );
 		} else {
-			md5anim->ConvertTimeToFrame( time, cycle, frametime );
+			md5anim->ConvertTimeToFrame( time, cycle, frametime, frameRateMultiplier);
 			md5anim->GetInterpolatedFrame( frametime, jointFrame, modelDef->GetChannelJoints( channel ), modelDef->NumJointsOnChannel( channel ) );
 		}
 	} else {
@@ -1872,7 +1899,7 @@ bool idAnimBlend::BlendAnim( int currentTime, int channel, int numJoints, idJoin
 		mixFrame = ( idJointQuat * )_alloca16( numJoints * sizeof( *jointFrame ) );
 
 		if ( !frame ) {
-			anim->MD5Anim( 0 )->ConvertTimeToFrame( time, cycle, frametime );
+			anim->MD5Anim( 0 )->ConvertTimeToFrame( time, cycle, frametime, frameRateMultiplier);
 		}
 
 		ptr = jointFrame;
@@ -3583,6 +3610,21 @@ void idAnimator::SetFrame( int channelNum, int animNum, int frame, int currentTi
 
 /*
 =====================
+idAnimator::UpdateFrameRateMultiplier
+=====================
+*/
+void idAnimator::UpdateFrameRateMultiplier(float new_framerate_multiplier) {
+	int i, j;
+	for (i = ANIMCHANNEL_ALL; i < ANIM_NumAnimChannels; i++) {
+		for (j = 0; j < ANIM_MaxAnimsPerChannel; j++) {
+			channels[i][j].frameRateMultiplier = new_framerate_multiplier;
+		}
+	}
+}
+
+
+/*
+=====================
 idAnimator::CycleAnim
 =====================
 */
@@ -3651,6 +3693,34 @@ void idAnimator::SyncAnimChannels( int channelNum, int fromChannelNum, int curre
 	if ( entity ) {
 		entity->BecomeActive( TH_ANIMATE );
 	}
+}
+
+/*
+=====================
+idAnimator::GetAllowFrameCommands
+=====================
+*/
+bool idAnimator::GetAllowFrameCommands(int channelNum) const {
+	if ( ( channelNum < 0 ) || ( channelNum >= ANIM_NumAnimChannels ) ) {
+		gameLocal.Error( "idAnimator::GetAllowFrameCommands : channel out of range" );
+		return false;
+	}
+
+	return channels[ channelNum ][ 0 ].allowFrameCommands;
+}
+
+/*
+=====================
+idAnimator::SetAllowFrameCommands
+=====================
+*/
+void idAnimator::SetAllowFrameCommands( int channelNum, bool allow) {
+	if ( ( channelNum < 0 ) || ( channelNum >= ANIM_NumAnimChannels ) ) {
+		gameLocal.Error( "idAnimator::GetAllowFrameCommands : channel out of range" );
+		return;
+	}
+
+	channels[ channelNum ][ 0 ].allowFrameCommands = allow;
 }
 
 /*

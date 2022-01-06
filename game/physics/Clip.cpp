@@ -545,8 +545,10 @@ idClipModel::Link
 ===============
 */
 void idClipModel::Link( idClip &clp ) {
-
-	assert( idClipModel::entity );
+	
+	if (!gameLocal.mpGame.IsGametypeCoopBased()) { //avoid very strange and uncommon crash in coop
+		assert( idClipModel::entity );
+	}
 	if ( !idClipModel::entity ) {
 		return;
 	}
@@ -965,7 +967,9 @@ idClip::TestHugeTranslation
 */
 ID_INLINE bool TestHugeTranslation( trace_t &results, const idClipModel *mdl, const idVec3 &start, const idVec3 &end, const idMat3 &trmAxis ) {
 	if ( mdl != NULL && ( end - start ).LengthSqr() > Square( CM_MAX_TRACE_DIST ) ) {
-		assert( 0 );
+		if (!gameLocal.mpGame.IsGametypeCoopBased()) { //Avoid crash for clients in coop (and in rare cases for server), ROE did the same in CTF so...
+			assert( 0 );
+		}
 
 		results.fraction = 0.0f;
 		results.endpos = start;
@@ -975,6 +979,7 @@ ID_INLINE bool TestHugeTranslation( trace_t &results, const idClipModel *mdl, co
 		results.c.entityNum = ENTITYNUM_WORLD;
 
 		if ( mdl->GetEntity() ) {
+			//SPAM in Delta labs sector 1 (client-side) by some stupid carton box, FIXME
 			gameLocal.Printf( "huge translation for clip model %d on entity %d '%s'\n", mdl->GetId(), mdl->GetEntity()->entityNumber, mdl->GetEntity()->GetName() );
 		} else {
 			gameLocal.Printf( "huge translation for clip model %d\n", mdl->GetId() );
@@ -1202,6 +1207,12 @@ bool idClip::Motion( trace_t &results, const idVec3 &start, const idVec3 &end, c
 	idRotation endRotation;
 	const idTraceModel *trm;
 
+	if (gameLocal.mpGame.IsGametypeCoopBased() && (rotation.GetOrigin() != start)) {
+#ifdef _DEBUG
+		common->Printf("[COOP FATAL] assert( rotation.GetOrigin() == start ) at idClip::Motion\n");
+#endif
+		return true; //should return true or false?
+	}
 	assert( rotation.GetOrigin() == start );
 
 	if ( TestHugeTranslation( results, mdl, start, end, trmAxis ) ) {
@@ -1292,7 +1303,7 @@ bool idClip::Motion( trace_t &results, const idVec3 &start, const idVec3 &end, c
 	if ( !passEntity || passEntity->entityNumber != ENTITYNUM_WORLD ) {
 		// rotational collision with world
 		idClip::numRotations++;
-		collisionModelManager->Rotation( &rotationalTrace, endPosition, endRotation, trm, trmAxis, contentMask, 0, vec3_origin, mat3_default );
+		collisionModelManager->Rotation( &rotationalTrace, endPosition, endRotation, trm, trmAxis, contentMask, 0, vec3_origin, mat3_default ); //crash in coop
 		rotationalTrace.c.entityNum = rotationalTrace.fraction != 1.0f ? ENTITYNUM_WORLD : ENTITYNUM_NONE;
 	} else {
 		memset( &rotationalTrace, 0, sizeof( rotationalTrace ) );

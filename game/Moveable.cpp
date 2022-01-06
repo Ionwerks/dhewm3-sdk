@@ -75,6 +75,9 @@ idMoveable::idMoveable( void ) {
 	unbindOnDeath		= false;
 	allowStep			= false;
 	canDamage			= false;
+	fl.networkSync		= false;
+	fl.coopNetworkSync	= true; //just to test something in coop
+	allowRemoveSync		= true;
 }
 
 /*
@@ -105,8 +108,20 @@ void idMoveable::Spawn( void ) {
 	}
 
 	if ( !collisionModelManager->TrmFromModel( clipModelName, trm ) ) {
-		gameLocal.Error( "idMoveable '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str() );
-		return;
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+			clipModelName = "models/mapobjects/filler/burgereat.lwo"; // DIRTY DISGUSTING HACK TO AVOID VERY RARE RANDOM CRASH
+
+			if (!collisionModelManager->TrmFromModel(clipModelName, trm)) {
+				gameLocal.Error("idMoveable '%s': cannot load collision model %s, entityDefName: %s\n", name.c_str(), clipModelName.c_str(), GetEntityDefName());
+			}
+			else {
+				gameLocal.Warning("[COOP] Crash avoided using a default collision model with entity: %s\n", GetEntityDefName());
+			}
+		}
+		else {
+			gameLocal.Error("idMoveable '%s': cannot load collision model %s", name.c_str(), clipModelName.c_str());
+			return;
+		}
 	}
 
 	// if the model should be shrinked
@@ -446,6 +461,10 @@ idMoveable::WriteToSnapshot
 */
 void idMoveable::WriteToSnapshot( idBitMsgDelta &msg ) const {
 	physicsObj.WriteToSnapshot( msg );
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		WriteBindToSnapshot(msg);
+		msg.WriteBits( IsHidden(), 1 );
+	}
 }
 
 /*
@@ -455,6 +474,15 @@ idMoveable::ReadFromSnapshot
 */
 void idMoveable::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	physicsObj.ReadFromSnapshot( msg );
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		ReadBindFromSnapshot(msg);
+		if ( msg.ReadBits( 1 ) ) {
+			Hide();
+		} else {
+			Show();
+		}
+	}
+
 	if ( msg.HasChanged() ) {
 		UpdateVisuals();
 	}
@@ -537,7 +565,6 @@ void idMoveable::Event_EnableDamage( float enable ) {
 	canDamage = ( enable != 0.0f );
 }
 
-
 /*
 ===============================================================================
 
@@ -562,6 +589,7 @@ idBarrel::idBarrel() {
 	additionalRotation = 0.0f;
 	additionalAxis.Identity();
 	fl.networkSync = true;
+	fl.coopNetworkSync = true;
 }
 
 /*
@@ -985,6 +1013,10 @@ void idExplodingBarrel::Killed( idEntity *inflictor, idEntity *attacker, int dam
 		PostEventSec( &EV_Explode, f );
 		StartSound( "snd_burn", SND_CHANNEL_ANY, 0, false, NULL );
 		AddParticles( spawnArgs.GetString ( "model_burn", "" ), true );
+
+		if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()) {
+			ServerSendEvent(EVENT_BURNING, NULL, false, -1);
+		}
 		return;
 	} else {
 		state = EXPLODING;
@@ -1065,7 +1097,7 @@ idExplodingBarrel::Damage
 ================
 */
 void idExplodingBarrel::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir,
-					  const char *damageDefName, const float damageScale, const int location ) {
+					  const char *damageDefName, const float damageScale, const int location, const bool canBeClientDamage) {
 
 	const idDict *damageDef = gameLocal.FindEntityDefDict( damageDefName );
 	if ( !damageDef ) {
@@ -1186,9 +1218,54 @@ bool idExplodingBarrel::ClientReceiveEvent( int event, int time, const idBitMsg 
 				ExplodingEffects( );
 			}
 			return true;
+		case EVENT_BURNING:
+			state = BURNING;
+			StartSound("snd_burn", SND_CHANNEL_ANY, 0, false, NULL);
+			AddParticles(spawnArgs.GetString("model_burn", ""), true);
+			return true;
 		default:
 			break;
 	}
 
 	return idBarrel::ClientReceiveEvent( event, time, msg );
+}
+
+
+/*
+================
+idExplodingBarrel::ClientPredictionThink
+================
+*/
+void idExplodingBarrel::ClientPredictionThink(void) {
+	idBarrel::ClientPredictionThink();
+
+	if (lightDefHandle >= 0) {
+		if (state == BURNING) {
+			// ramp the color up over 250 ms
+			float pct = (gameLocal.time - lightTime) / 250.f;
+			if (pct > 1.0f) {
+				pct = 1.0f;
+			}
+			light.origin = physicsObj.GetAbsBounds().GetCenter();
+			light.axis = mat3_identity;
+			light.shaderParms[SHADERPARM_RED] = pct;
+			light.shaderParms[SHADERPARM_GREEN] = pct;
+			light.shaderParms[SHADERPARM_BLUE] = pct;
+			light.shaderParms[SHADERPARM_ALPHA] = pct;
+			gameRenderWorld->UpdateLightDef(lightDefHandle, &light);
+		}
+		else {
+			if (gameLocal.time - lightTime > 250) {
+				gameRenderWorld->FreeLightDef(lightDefHandle);
+				lightDefHandle = -1;
+			}
+			return;
+		}
+	}
+
+	if (particleModelDefHandle >= 0) {
+		particleRenderEntity.origin = physicsObj.GetAbsBounds().GetCenter();
+		particleRenderEntity.axis = mat3_identity;
+		gameRenderWorld->UpdateEntityDef(particleModelDefHandle, &particleRenderEntity);
+	}
 }

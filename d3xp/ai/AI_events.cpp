@@ -52,6 +52,9 @@ const idEventDef AI_AttackMissile( "attackMissile", "s", 'e' );
 const idEventDef AI_FireMissileAtTarget( "fireMissileAtTarget", "ss", 'e' );
 const idEventDef AI_LaunchMissile( "launchMissile", "vv", 'e' );
 #ifdef _D3XP
+
+const idEventDef AI_LaunchHomingMissile( "launchHomingMissile" ); //Added for the LM
+const idEventDef AI_SetHomingMissileGoal( "setHomingMissileGoal" ); //Added for the LM
 const idEventDef AI_LaunchProjectile( "launchProjectile", "s" );
 #endif
 const idEventDef AI_AttackMelee( "attackMelee", "s", 'd' );
@@ -193,6 +196,9 @@ CLASS_DECLARATION( idActor, idAI )
 	EVENT( AI_LaunchMissile,					idAI::Event_LaunchMissile )
 #ifdef _D3XP
 	EVENT( AI_LaunchProjectile,					idAI::Event_LaunchProjectile )
+	//Added for the LM
+	EVENT( AI_LaunchHomingMissile,				idAI::Event_LaunchHomingMissile )
+	EVENT( AI_SetHomingMissileGoal,				idAI::Event_SetHomingMissileGoal )
 #endif
 	EVENT( AI_AttackMelee,						idAI::Event_AttackMelee )
 	EVENT( AI_DirectDamage,						idAI::Event_DirectDamage )
@@ -344,32 +350,59 @@ void idAI::Event_Touch( idEntity *other, trace_t *trace ) {
 idAI::Event_FindEnemy
 =====================
 */
-void idAI::Event_FindEnemy( int useFOV ) {
-	int			i;
-	idEntity	*ent;
-	idActor		*actor;
+void idAI::Event_FindEnemy(int useFOV) {
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		idPlayer* closestPlayer = NULL;
+		float shortestDist = idMath::INFINITY;
+		idPlayer* player;
+		float dist;
+		idVec3		delta;
+		for (int i = 0; i < gameLocal.numClients; i++) {
+			player = gameLocal.GetClientByNum(i);
 
-	if ( gameLocal.InPlayerPVS( this ) ) {
-		for ( i = 0; i < gameLocal.numClients ; i++ ) {
-			ent = gameLocal.entities[ i ];
-
-			if ( !ent || !ent->IsType( idActor::Type ) ) {
+			//if (!player || player->spectating || player->health <= 0 || !(ReactionTo(player) & ATTACK_ON_SIGHT)) {
+			if (!player || player->spectating || player->health <= 0) { //idk why !(ReactionTo(player) & ATTACK_ON_SIGHT) isn't working
 				continue;
 			}
 
-			actor = static_cast<idActor *>( ent );
-			if ( ( actor->health <= 0 ) || !( ReactionTo( actor ) & ATTACK_ON_SIGHT ) ) {
-				continue;
-			}
+			//was better but marked as slow by the engine
+			//dist = TravelDistance(this->GetPhysics()->GetOrigin(), player->GetPhysics()->GetOrigin());
+			delta = physicsObj.GetOrigin() - player->GetPhysics()->GetOrigin();
+			dist = delta.LengthSqr();
 
-			if ( CanSee( actor, useFOV != 0 ) ) {
-				idThread::ReturnEntity( actor );
-				return;
+			if ((dist < shortestDist) && CanSee(player, useFOV != 0)) {
+				shortestDist = dist;
+				closestPlayer = player;
+			}
+		}
+		idThread::ReturnEntity(closestPlayer);
+		return;
+	} else {
+		int			i;
+		idEntity* ent;
+		idActor* actor;
+
+		if (gameLocal.InPlayerPVS(this)) {
+			for (i = 0; i < gameLocal.numClients; i++) {
+				ent = gameLocal.entities[i];
+
+				if (!ent || !ent->IsType(idActor::Type)) {
+					continue;
+				}
+
+				actor = static_cast<idActor*>(ent);
+				if ((actor->health <= 0) || !(ReactionTo(actor) & ATTACK_ON_SIGHT)) {
+					continue;
+				}
+
+				if (CanSee(actor, useFOV != 0)) {
+					idThread::ReturnEntity(actor);
+					return;
+				}
 			}
 		}
 	}
-
-	idThread::ReturnEntity( NULL );
+	idThread::ReturnEntity(NULL);
 }
 
 /*
@@ -396,7 +429,7 @@ void idAI::Event_FindEnemyAI( int useFOV ) {
 		}
 
 		actor = static_cast<idActor *>( ent );
-		if ( ( actor->health <= 0 ) || !( ReactionTo( actor ) & ATTACK_ON_SIGHT ) ) {
+		if ( ( actor->health <= 0 ) || !( ReactionTo( actor ) & ATTACK_ON_SIGHT ) ) { //!ent->IsType( idPlayer::Type ) dirty hack, just for test
 			continue;
 		}
 
@@ -517,15 +550,28 @@ idAI::Event_HeardSound
 void idAI::Event_HeardSound( int ignore_team ) {
 	// check if we heard any sounds in the last frame
 	idActor	*actor = gameLocal.GetAlertEntity();
-	if ( actor && ( !ignore_team || ( ReactionTo( actor ) & ATTACK_ON_SIGHT ) ) && gameLocal.InPlayerPVS( this ) ) {
-		idVec3 pos = actor->GetPhysics()->GetOrigin();
-		idVec3 org = physicsObj.GetOrigin();
-		float dist = ( pos - org ).LengthSqr();
-		if ( dist < Square( AI_HEARING_RANGE ) ) {
-			idThread::ReturnEntity( actor );
-			return;
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		if ( actor && ( !ignore_team || ( ReactionTo( actor ) & ATTACK_ON_SIGHT ) ) && gameLocal.InCoopPlayersPVS( this ) ) {
+			idVec3 pos = actor->GetPhysics()->GetOrigin();
+			idVec3 org = physicsObj.GetOrigin();
+			float dist = ( pos - org ).LengthSqr();
+			if ( dist < Square( AI_HEARING_RANGE ) ) {
+				idThread::ReturnEntity( actor );
+				return;
+			}
+		}
+	} else {
+		if ( actor && ( !ignore_team || ( ReactionTo( actor ) & ATTACK_ON_SIGHT ) ) && gameLocal.InPlayerPVS( this ) ) {
+			idVec3 pos = actor->GetPhysics()->GetOrigin();
+			idVec3 org = physicsObj.GetOrigin();
+			float dist = ( pos - org ).LengthSqr();
+			if ( dist < Square( AI_HEARING_RANGE ) ) {
+				idThread::ReturnEntity( actor );
+				return;
+			}
 		}
 	}
+
 
 	idThread::ReturnEntity( NULL );
 }
@@ -576,6 +622,10 @@ void idAI::Event_CreateMissile( const char *jointname ) {
 	idVec3 muzzle;
 	idMat3 axis;
 
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && (!g_clientsideDamage.GetBool() || AI_DEAD)) {
+		return idThread::ReturnEntity( NULL );
+	}
+
 	if ( !projectileDef ) {
 		gameLocal.Warning( "%s (%s) doesn't have a projectile specified", name.c_str(), GetEntityDefName() );
 		return idThread::ReturnEntity( NULL );
@@ -599,9 +649,18 @@ idAI::Event_AttackMissile
 =====================
 */
 void idAI::Event_AttackMissile( const char *jointname ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && (!g_clientsideDamage.GetBool() || AI_DEAD)) {
+		return idThread::ReturnEntity( NULL );
+	}
+
 	idProjectile *proj;
 
-	proj = LaunchProjectile( jointname, enemy.GetEntity(), true );
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && enemy.GetEntity()) {
+		proj = LaunchProjectile( jointname, enemy.GetEntity(), false );
+	} else {
+		proj = LaunchProjectile( jointname, enemy.GetEntity(), true );
+	}
 	idThread::ReturnEntity( proj );
 }
 
@@ -611,6 +670,12 @@ idAI::Event_FireMissileAtTarget
 =====================
 */
 void idAI::Event_FireMissileAtTarget( const char *jointname, const char *targetname ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient  && (!g_clientsideDamage.GetBool() || AI_DEAD)) {
+		//gameLocal.Warning( "[COOP] Event_FireMissileAtTarget called by a client!\n"); //not a warning, just a natural thing in coop
+		return idThread::ReturnEntity( NULL );
+	}
+
 	idEntity		*aent;
 	idProjectile	*proj;
 
@@ -629,6 +694,24 @@ idAI::Event_LaunchMissile
 =====================
 */
 void idAI::Event_LaunchMissile( const idVec3 &org, const idAngles &ang ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && AI_DEAD) {
+		return idThread::ReturnEntity( NULL ); //avoid bug while using g_clientsideDamage 1
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && (!g_clientsideDamage.GetBool() || AI_DEAD)) {
+		if ( (flashJointWorld != INVALID_JOINT) && !AI_DEAD ) {
+			idVec3 muzzle;
+			animator.GetJointTransform( flashJointWorld, gameLocal.time, muzzle, worldMuzzleFlash.axis );
+			animator.GetJointTransform( flashJointWorld, gameLocal.time, muzzle, worldMuzzleFlash.axis );
+			muzzle = physicsObj.GetOrigin() + ( muzzle + modelOffset ) * viewAxis * physicsObj.GetGravityAxis();
+			TriggerWeaponEffects( muzzle ); //to show flash effects for clients
+			//common->Printf("[debug] Event_LaunchMissile\n");
+		}
+		//gameLocal.Warning( "[COOP] Event_LaunchMissile called by a client!\n"); //not a warning, just a natural thing in coop
+		return idThread::ReturnEntity( NULL );
+	}
+
 	idVec3		start;
 	trace_t		tr;
 	idBounds	projBounds;
@@ -643,6 +726,14 @@ void idAI::Event_LaunchMissile( const idVec3 &org, const idAngles &ang ) {
 	}
 
 	axis = ang.ToMat3();
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && enemy.GetEntity()) {
+		idProjectile	*proj;
+		proj = CS_LaunchProjectile( org, axis[ 0 ], enemy.GetEntity(), false );
+		idThread::ReturnEntity( proj );
+		return;
+	}
+
 	if ( !projectile.GetEntity() ) {
 		CreateProjectile( org, axis[ 0 ] );
 	}
@@ -1231,11 +1322,21 @@ void idAI::Event_GetCombatNode( void ) {
 		// if we can see he's not in the last place we saw him
 
 #ifdef _D3XP
-		if ( team == 0 ) {
+		if ( team == 0 && !gameLocal.mpGame.IsFlagMsgOn() ) { //fix crash in ROE librecoop
 			// find the closest attack node to the player
 			bestNode = NULL;
+
+			idPlayer*	p;
+			if (gameLocal.mpGame.IsGametypeCoopBased()) {
+				p = GetClosestPlayerEnemy();
+				if (!p) {
+					p = gameLocal.GetCoopPlayer();
+				}
+			} else {
+				p =  gameLocal.GetLocalPlayer();
+			}
 			const idVec3 &myPos = physicsObj.GetOrigin();
-			const idVec3 &playerPos = gameLocal.GetLocalPlayer()->GetPhysics()->GetOrigin();
+			const idVec3 &playerPos = p->GetPhysics()->GetOrigin();
 
 			bestDist = ( myPos - playerPos ).LengthSqr();
 
@@ -1431,6 +1532,11 @@ idAI::Event_CanSeeEntity
 =====================
 */
 void idAI::Event_CanSeeEntity( idEntity *ent ) {
+
+	if (!ent && gameLocal.mpGame.IsGametypeCoopBased() && ((idStr::FindText(GetEntityDefName(), "char_sentry") != -1) || (idStr::FindText(GetEntityDefName(), "comm1_sentry") != -1))) {
+		ent = GetClosestPlayer();
+	}
+
 	if ( !ent ) {
 		idThread::ReturnInt( false );
 		return;
@@ -1446,6 +1552,11 @@ idAI::Event_SetTalkTarget
 =====================
 */
 void idAI::Event_SetTalkTarget( idEntity *target ) {
+
+	if ((!target || !target->IsType( idActor::Type )) && gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isNPC(this)) {
+		target = GetFocusPlayer();
+	}
+
 	if ( target && !target->IsType( idActor::Type ) ) {
 		gameLocal.Error( "Cannot set talk target to '%s'.  Not a character or player.", target->GetName() );
 	}
@@ -1999,7 +2110,8 @@ idAI::Event_Burn
 =====================
 */
 void idAI::Event_Burn( void ) {
-	renderEntity.shaderParms[ SHADERPARM_TIME_OF_DEATH ] = gameLocal.time * 0.001f;
+	renderEntity.shaderParms[SHADERPARM_TIME_OF_DEATH] = gameLocal.time * 0.001f;
+
 	SpawnParticles( "smoke_burnParticleSystem" );
 	UpdateVisuals();
 }
@@ -2431,6 +2543,15 @@ idAI::Event_LookAtEntity
 =====================
 */
 void idAI::Event_LookAtEntity( idEntity *ent, float duration ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased()) { //Hack for sentrybot and/or npc
+		if (!ent && ((idStr::FindText(GetEntityDefName(), "char_sentry") != -1) || (idStr::FindText(GetEntityDefName(), "comm1_sentry") != -1))) {
+			ent = GetClosestPlayer();
+		} else if ((!ent || ent == this) && (!focusEntity.GetEntity() || (focusEntity.GetEntity() && ( focusTime < gameLocal.time )))  && gameLocal.isNPC(this)) {
+			ent = GetFocusPlayer();
+		}
+	}
+
 	if ( ent == this ) {
 		ent = NULL;
 	}
@@ -2755,6 +2876,11 @@ void idAI::Event_CanReachEntity( idEntity *ent ) {
 	int			areaNum;
 	idVec3		pos;
 
+	if (!ent && gameLocal.mpGame.IsGametypeCoopBased() && ((idStr::FindText(GetEntityDefName(), "char_sentry") != -1) || (idStr::FindText(GetEntityDefName(), "comm1_sentry") != -1))) {
+		ent = GetClosestPlayer();
+	}
+
+
 	if ( !ent ) {
 		idThread::ReturnInt( false );
 		return;
@@ -2840,18 +2966,31 @@ void idAI::Event_GetReachableEntityPosition( idEntity *ent ) {
 	int		toAreaNum;
 	idVec3	pos;
 
+	if (!ent && gameLocal.mpGame.IsGametypeCoopBased() && ((idStr::FindText(GetEntityDefName(), "char_sentry") != -1) || (idStr::FindText(GetEntityDefName(), "comm1_sentry") != -1))) {
+		ent = GetClosestPlayer();
+	}
+
+	bool returnStatus=true;
+
 	if ( move.moveType != MOVETYPE_FLY ) {
 		if ( !ent->GetFloorPos( 64.0f, pos ) ) {
-			// NOTE: not a good way to return 'false'
-			return idThread::ReturnVector( vec3_zero );
-		}
-		if ( ent->IsType( idActor::Type ) && static_cast<idActor *>( ent )->OnLadder() ) {
-			// NOTE: not a good way to return 'false'
-			return idThread::ReturnVector( vec3_zero );
+			returnStatus = false;
+		}else if ( ent->IsType( idActor::Type ) && static_cast<idActor *>( ent )->OnLadder() ) {
+			returnStatus = false;
 		}
 	} else {
 		pos = ent->GetPhysics()->GetOrigin();
 	}
+
+	if (!returnStatus) {
+		if (ent->IsType(idPlayer::Type)  && ((idStr::FindText(GetEntityDefName(), "char_sentry") != -1) || (idStr::FindText(GetEntityDefName(), "comm1_sentry") != -1))) {
+			pos = ent->GetPhysics()->GetOrigin();
+		} else {
+			// NOTE: not a good way to return 'false'
+			return idThread::ReturnVector( vec3_zero );
+		}
+	}
+
 
 	if ( aas ) {
 		toAreaNum = PointReachableAreaNum( pos );
@@ -2902,5 +3041,96 @@ void idAI::Event_GetEmitter( const char* name ) {
 void idAI::Event_StopEmitter( const char* name ) {
 	StopEmitter(name);
 }
+
+//Added for LM
+
+/*
+=====================
+idAI::Event_LaunchHomingMissile
+=====================
+*/
+void idAI::Event_LaunchHomingMissile() {
+	idVec3		start;
+	trace_t		tr;
+	idBounds	projBounds;
+	const idClipModel *projClip;
+	idMat3		axis;
+	float		distance;
+
+	if ( !projectileDef ) {
+		gameLocal.Warning( "%s (%s) doesn't have a projectile specified", name.c_str(), GetEntityDefName() );
+		idThread::ReturnEntity( NULL );
+		return;
+	}
+
+	idActor *enemy = GetEnemy();
+	if ( enemy == NULL ) {
+		idThread::ReturnEntity( NULL );
+		return;
+	}
+
+	idVec3 org = GetPhysics()->GetOrigin() + idVec3( 0.0f, 0.0f, 250.0f );
+	idVec3 goal = enemy->GetPhysics()->GetOrigin();
+	homingMissileGoal = goal;
+
+//	axis = ( goal - org ).ToMat3();
+//	axis.Identity();
+	if ( !projectile.GetEntity() ) {
+		idHomingProjectile *homing = ( idHomingProjectile * ) CreateProjectile( org, idVec3( 0.0f, 0.0f, 1.0f ) );
+		if ( homing != NULL ) {
+			homing->SetEnemy( enemy );
+			homing->SetSeekPos( homingMissileGoal );
+		}
+	}
+
+	// make sure the projectile starts inside the monster bounding box
+	const idBounds &ownerBounds = physicsObj.GetAbsBounds();
+	projClip = projectile.GetEntity()->GetPhysics()->GetClipModel();
+	projBounds = projClip->GetBounds().Rotate( projClip->GetAxis() );
+
+	// check if the owner bounds is bigger than the projectile bounds
+	if ( ( ( ownerBounds[1][0] - ownerBounds[0][0] ) > ( projBounds[1][0] - projBounds[0][0] ) ) &&
+		( ( ownerBounds[1][1] - ownerBounds[0][1] ) > ( projBounds[1][1] - projBounds[0][1] ) ) &&
+		( ( ownerBounds[1][2] - ownerBounds[0][2] ) > ( projBounds[1][2] - projBounds[0][2] ) ) ) {
+			if ( (ownerBounds - projBounds).RayIntersection( org, viewAxis[ 0 ], distance ) ) {
+				start = org + distance * viewAxis[ 0 ];
+			} else {
+				start = ownerBounds.GetCenter();
+			}
+	} else {
+		// projectile bounds bigger than the owner bounds, so just start it from the center
+		start = ownerBounds.GetCenter();
+	}
+
+	gameLocal.clip.Translation( tr, start, org, projClip, projClip->GetAxis(), MASK_SHOT_RENDERMODEL, this );
+
+	// launch the projectile
+	idThread::ReturnEntity( projectile.GetEntity() );
+	idVec3 dir = homingMissileGoal - org;
+	idAngles ang = dir.ToAngles();
+	ang.pitch = -45.0f;
+	projectile.GetEntity()->Launch( org, ang.ToForward(), vec3_origin );
+	projectile = NULL;
+
+	TriggerWeaponEffects( tr.endpos );
+
+	lastAttackTime = gameLocal.time;
+}
+
+/*
+=====================
+idAI::Event_SetHomingMissileGoal
+=====================
+*/
+void idAI::Event_SetHomingMissileGoal() {
+	idActor *enemy = GetEnemy();
+	if ( enemy == NULL ) {
+		idThread::ReturnEntity( NULL );
+		return;
+	}
+
+	homingMissileGoal = enemy->GetPhysics()->GetOrigin();
+}
+
 
 #endif

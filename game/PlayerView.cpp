@@ -443,7 +443,7 @@ void idPlayerView::SingleView( idUserInterface *hud, const renderView_t *view ) 
 	gameSoundWorld->PlaceListener( view->vieworg, view->viewaxis, player->entityNumber + 1, gameLocal.time, hud ? hud->State().GetString( "location" ) : "Undefined" );
 
 	// if the objective system is up, don't do normal drawing
-	if ( player->objectiveSystemOpen ) {
+	if ( player->objectiveSystemOpen && (!gameLocal.mpGame.IsGametypeCoopBased() || player->entityNumber == gameLocal.localClientNum)) {
 		player->objectiveSystem->Redraw( gameLocal.time );
 		return;
 	}
@@ -612,6 +612,10 @@ assumes: color.w is 0 or 1
 =================
 */
 void idPlayerView::Fade( idVec4 color, int time ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && player->entityNumber != gameLocal.localClientNum) {
+		return;
+	}
 
 	if ( !fadeTime ) {
 		fadeFromColor.Set( 0.0f, 0.0f, 0.0f, 1.0f - color[ 3 ] );

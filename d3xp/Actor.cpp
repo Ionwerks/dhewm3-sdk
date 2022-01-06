@@ -35,6 +35,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "WorldSpawn.h"
 
 #include "Actor.h"
+#include "Player.h" //test only
 
 
 /***********************************************************************
@@ -475,6 +476,22 @@ idActor::idActor( void ) {
 	enemyNode.SetOwner( this );
 	enemyList.SetOwner( this );
 
+	nextTimeHealthReaded = 0; //added for clientside damage
+	clientsideDamageInflicted = 0; //added for clientside damage
+	clientsideDamageLocation = 0; // for g_clientsideDamage 1
+	clientsideDamageDir = vec3_zero;  // for g_clientsideDamage 1
+	lastPlayerDamage = NULL;
+
+	currentTorsoAnim = 0;
+	currentLegsAnim = 0;
+	currentHeadAnim = 0;
+	currentAnimType = ACTOR_ANIM_CYCLE;
+	snapshotTorsoAnim = 0;
+	snapshotLegsAnim = 0;
+	snapshotHeadAnim = 0;
+	snapshotAnimType = ACTOR_ANIM_CYCLE;
+
+	killedByGrabber = false;
 #ifdef _D3XP
 	damageCap = -1;
 #endif
@@ -684,7 +701,7 @@ void idActor::SetupHead( void ) {
 	int					i;
 	const idKeyValue	*sndKV;
 
-	if ( gameLocal.isClient ) {
+	if ( gameLocal.isClient && !gameLocal.mpGame.IsGametypeCoopBased()) {
 		return;
 	}
 
@@ -707,6 +724,12 @@ void idActor::SetupHead( void ) {
 
 		// copy any sounds in case we have frame commands on the head
 		idDict	args;
+		if (gameLocal.mpGame.IsGametypeCoopBased()) {
+			if (isMapEntity) {
+				args.Set("mapEntity", "1"); //if the body is a map entity, then set the head to be one too
+			}
+		}
+
 		sndKV = spawnArgs.MatchPrefix( "snd_", NULL );
 		while( sndKV ) {
 			args.Set( sndKV->GetKey(), sndKV->GetValue() );
@@ -719,7 +742,7 @@ void idActor::SetupHead( void ) {
 #endif
 
 
-		headEnt = static_cast<idAFAttachment *>( gameLocal.SpawnEntityType( idAFAttachment::Type, &args ) );
+		headEnt = static_cast<idAFAttachment *>( gameLocal.SpawnEntityType( idAFAttachment::Type, &args , true) ); //In coop we can spawn heads
 		headEnt->SetName( va( "%s_head", name.c_str() ) );
 		headEnt->SetBody( this, headModel, damageJoint );
 		head = headEnt;
@@ -1695,7 +1718,9 @@ bool idActor::StartRagdoll( void ) {
 	af.GetPhysics()->SetContactFrictionDent( contactFrictionDent, contactFrictionDentStart, contactFrictionDentEnd );
 
 	// drop any items the actor is holding
-	idMoveableItem::DropItems( this, "death", NULL );
+	if (!gameLocal.mpGame.IsGametypeCoopBased() || !gameLocal.isClient || this->IsType(idPlayer::Type) || !fl.coopNetworkSync) {
+		idMoveableItem::DropItems(this, "death", NULL);
+	}
 
 	// drop any articulated figures the actor is holding
 	idAFEntity_Base::DropAFs( this, "death", NULL );
@@ -2171,7 +2196,7 @@ idActor::Gib
 */
 void idActor::Gib( const idVec3 &dir, const char *damageDefName ) {
 	// no gibbing in multiplayer - by self damage or by moving objects
-	if ( gameLocal.isMultiplayer ) {
+	if ( gameLocal.isMultiplayer && !gameLocal.mpGame.IsGametypeCoopBased() ) { //gibs in coop
 		return;
 	}
 	// only gib once
@@ -2206,7 +2231,26 @@ calls Damage()
 ============
 */
 void idActor::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir,
-					  const char *damageDefName, const float damageScale, const int location ) {
+					  const char *damageDefName, const float damageScale, const int location, const bool canBeClientDamage ) {
+	if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased() && !g_clientsideDamage.GetBool() && killedByGrabber) { //Killed by grabbed while not using g_clientsideDamage
+		idBitMsg	msg;
+		byte		msgBuf[MAX_EVENT_PARAM_SIZE];
+		msg.Init(msgBuf, sizeof(msgBuf));
+		msg.BeginWriting();
+		msg.WriteBits(gameLocal.localClientNum, idMath::BitsForInteger(MAX_CLIENTS));
+		msg.WriteShort(999);
+		msg.WriteShort(location);
+		msg.WriteFloat(dir.x);
+		msg.WriteFloat(dir.y);
+		msg.WriteFloat(dir.z);
+		ClientSendEvent(EVENT_CLIENTDAMAGE, &msg); // Help to avoid bug related to enemies killed with Grabber getting invisible clientside
+		return;
+	}
+
+	if (gameLocal.isClient && (!g_clientsideDamage.GetBool() || !canBeClientDamage || ((!inflictor || !inflictor->clientsideNode.InList()) && !killedByGrabber) || !attacker || attacker->entityNumber != gameLocal.localClientNum)) {
+		return;
+	}
+
 	if ( !fl.takedamage ) {
 		return;
 	}
@@ -2222,7 +2266,7 @@ void idActor::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir
 	SetTimeState ts( timeGroup );
 
 	// Helltime boss is immune to all projectiles except the helltime killer
-	if ( finalBoss && idStr::Icmp(inflictor->GetEntityDefName(), "projectile_helltime_killer") ) {
+	if ( finalBoss && inflictor && idStr::Icmp(inflictor->GetEntityDefName(), "projectile_helltime_killer") ) { //STRADEX: THANK YOU, REALLY, FOR TAKING AWAY A WHOLE DAY OF MY LIFE :)
 		return;
 	}
 
@@ -2248,7 +2292,17 @@ void idActor::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir
 	// inform the attacker that they hit someone
 	attacker->DamageFeedback( this, inflictor, damage );
 	if ( damage > 0 ) {
+		int oldHealth = health;
 		health -= damage;
+
+		if (oldHealth > 0 && gameLocal.isClient) {
+			clientsideDamageLocation = location; // for g_clientsideDamage 1
+			clientsideDamageDir.x = dir.x;
+			clientsideDamageDir.y = dir.y;
+			clientsideDamageDir.z = dir.z;
+
+			clientsideDamageInflicted += damage;
+		}
 
 #ifdef _D3XP
 		//Check the health against any damage cap that is currently set
@@ -2262,8 +2316,73 @@ void idActor::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir
 				health = -999;
 			}
 			Killed( inflictor, attacker, damage, dir, location );
-			if ( ( health < -20 ) && spawnArgs.GetBool( "gib" ) && damageDef->GetBool( "gib" ) ) {
+			if ( ( (health < -20) || gameLocal.mpGame.IsGametypeCoopBased() ) && spawnArgs.GetBool( "gib" ) && damageDef->GetBool( "gib" ) && !gameLocal.isClient  ) { //instant gib in coop
 				Gib( dir, damageDefName );
+			}
+		} else {
+			Pain( inflictor, attacker, damage, dir, location );
+		}
+	} else {
+		// don't accumulate knockback
+		if ( af.IsLoaded() ) {
+			// clear impacts
+			af.Rest();
+
+			// physics is turned off by calling af.Rest()
+			BecomeActive( TH_PHYSICS );
+		}
+	}
+}
+
+/*
+============
+ClientReceivedDamage
+this		entity that is being damaged
+inflictor	entity that is causing the damage
+attacker	entity that caused the inflictor to damage targ
+	example: this=monster, inflictor=rocket, attacker=player
+dir			direction of the attack for knockback in global space
+damage		amount of damage being inflicted
+inflictor, attacker, dir, and point can be NULL for environmental effects
+============
+*/
+void idActor::ClientReceivedDamage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, int damage, const int location ) {
+
+	if ( !fl.takedamage ) {
+		return;
+	}
+
+	if ( !inflictor ) {
+		inflictor = gameLocal.world;
+	}
+
+	if ( !attacker ) {
+		attacker = gameLocal.world;
+	}
+
+	// Helltime boss is immune to all projectiles except the helltime killer
+	if ( finalBoss && inflictor && idStr::Icmp(inflictor->GetEntityDefName(), "projectile_helltime_killer") ) {
+		return;
+	}
+
+	/*
+	// Maledict is immume to the falling asteroids
+	if ( !idStr::Icmp( GetEntityDefName(), "monster_boss_d3xp_maledict" ) &&
+		(!idStr::Icmp( damageDefName, "damage_maledict_asteroid" ) || !idStr::Icmp( damageDefName, "damage_maledict_asteroid_splash" ) ) ) {
+		return;
+	}
+	*/
+
+	if ( damage > 0 ) {
+		health -= damage;
+
+		if ( health <= 0 ) {
+			if ( health < -999 ) {
+				health = -999;
+			}
+			Killed( inflictor, attacker, damage, dir, location );
+			if ( ( (health < -20) || gameLocal.mpGame.IsGametypeCoopBased() ) && spawnArgs.GetBool( "gib" )) { //instant gib in coop
+				Gib( dir, NULL );
 			}
 		} else {
 			Pain( inflictor, attacker, damage, dir, location );
@@ -2295,6 +2414,14 @@ idActor::Pain
 =====================
 */
 bool idActor::Pain( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location ) {
+
+	if ( !inflictor ) {
+		inflictor = gameLocal.world;
+	}
+	if ( !attacker ) {
+		attacker = gameLocal.world;
+	}
+
 	if ( af.IsLoaded() ) {
 		// clear impacts
 		af.Rest();
@@ -2643,78 +2770,96 @@ idActor::Event_PlayAnim
 ===============
 */
 void idActor::Event_PlayAnim( int channel, const char *animname ) {
-	animFlags_t	flags;
-	idEntity *headEnt;
 	int	anim;
 
-	anim = GetAnim( channel, animname );
-	if ( !anim ) {
-		if ( ( channel == ANIMCHANNEL_HEAD ) && head.GetEntity() ) {
-			gameLocal.DPrintf( "missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), spawnArgs.GetString( "def_head", "" ) );
-		} else {
-			gameLocal.DPrintf( "missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), GetEntityDefName() );
+	anim = GetAnim(channel, animname);
+	if (!anim) {
+		if ((channel == ANIMCHANNEL_HEAD) && head.GetEntity()) {
+			gameLocal.DPrintf("missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), spawnArgs.GetString("def_head", ""));
 		}
-		idThread::ReturnInt( 0 );
+		else {
+			gameLocal.DPrintf("missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), GetEntityDefName());
+		}
+		idThread::ReturnInt(0);
 		return;
 	}
 
-	switch( channel ) {
-	case ANIMCHANNEL_HEAD :
+	PlayAnimID(channel, anim);
+
+	idThread::ReturnInt(1);
+}
+
+/*
+===============
+idActor::PlayAnimID
+===============
+*/
+
+void idActor::PlayAnimID(int channel, int anim) {
+	animFlags_t	flags;
+	idEntity* headEnt;
+
+	currentAnimType = ACTOR_ANIM_PLAY;
+
+	switch (channel) {
+	case ANIMCHANNEL_HEAD:
+		currentHeadAnim = anim;
 		headEnt = head.GetEntity();
-		if ( headEnt ) {
+		if (headEnt) {
 			headAnim.idleAnim = false;
-			headAnim.PlayAnim( anim );
+			headAnim.PlayAnim(anim);
 			flags = headAnim.GetAnimFlags();
-			if ( !flags.prevent_idle_override ) {
-				if ( torsoAnim.IsIdle() ) {
+			if (!flags.prevent_idle_override) {
+				if (torsoAnim.IsIdle()) {
 					torsoAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-					SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames );
-					if ( legsAnim.IsIdle() ) {
+					SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames);
+					if (legsAnim.IsIdle()) {
 						legsAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-						SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames );
+						SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames);
 					}
 				}
 			}
 		}
 		break;
 
-	case ANIMCHANNEL_TORSO :
+	case ANIMCHANNEL_TORSO:
+		currentTorsoAnim = anim;
 		torsoAnim.idleAnim = false;
-		torsoAnim.PlayAnim( anim );
+		torsoAnim.PlayAnim(anim);
 		flags = torsoAnim.GetAnimFlags();
-		if ( !flags.prevent_idle_override ) {
-			if ( headAnim.IsIdle() ) {
+		if (!flags.prevent_idle_override) {
+			if (headAnim.IsIdle()) {
 				headAnim.animBlendFrames = torsoAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames );
+				SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames);
 			}
-			if ( legsAnim.IsIdle() ) {
+			if (legsAnim.IsIdle()) {
 				legsAnim.animBlendFrames = torsoAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames );
+				SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames);
 			}
 		}
 		break;
 
-	case ANIMCHANNEL_LEGS :
+	case ANIMCHANNEL_LEGS:
+		currentLegsAnim = anim;
 		legsAnim.idleAnim = false;
-		legsAnim.PlayAnim( anim );
+		legsAnim.PlayAnim(anim);
 		flags = legsAnim.GetAnimFlags();
-		if ( !flags.prevent_idle_override ) {
-			if ( torsoAnim.IsIdle() ) {
+		if (!flags.prevent_idle_override) {
+			if (torsoAnim.IsIdle()) {
 				torsoAnim.animBlendFrames = legsAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames );
-				if ( headAnim.IsIdle() ) {
+				SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames);
+				if (headAnim.IsIdle()) {
 					headAnim.animBlendFrames = legsAnim.lastAnimBlendFrames;
-					SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames );
+					SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames);
 				}
 			}
 		}
 		break;
 
-	default :
-		gameLocal.Error( "Unknown anim group" );
+	default:
+		gameLocal.Error("Unknown anim group");
 		break;
 	}
-	idThread::ReturnInt( 1 );
 }
 
 /*
@@ -2723,73 +2868,92 @@ idActor::Event_PlayCycle
 ===============
 */
 void idActor::Event_PlayCycle( int channel, const char *animname ) {
-	animFlags_t	flags;
+
 	int			anim;
 
-	anim = GetAnim( channel, animname );
-	if ( !anim ) {
-		if ( ( channel == ANIMCHANNEL_HEAD ) && head.GetEntity() ) {
-			gameLocal.DPrintf( "missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), spawnArgs.GetString( "def_head", "" ) );
-		} else {
-			gameLocal.DPrintf( "missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), GetEntityDefName() );
+	anim = GetAnim(channel, animname);
+	if (!anim) {
+		if ((channel == ANIMCHANNEL_HEAD) && head.GetEntity()) {
+			gameLocal.DPrintf("missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), spawnArgs.GetString("def_head", ""));
 		}
-		idThread::ReturnInt( false );
+		else {
+			gameLocal.DPrintf("missing '%s' animation on '%s' (%s)\n", animname, name.c_str(), GetEntityDefName());
+		}
+		idThread::ReturnInt(false);
 		return;
 	}
 
-	switch( channel ) {
-	case ANIMCHANNEL_HEAD :
+	PlayCycleID(channel, anim);
+
+	idThread::ReturnInt(true);
+}
+
+/*
+===============
+idActor::PlayCycleID
+===============
+*/
+void idActor::PlayCycleID(int channel, int anim) {
+
+	animFlags_t	flags;
+
+	currentAnimType = ACTOR_ANIM_CYCLE;
+
+	switch (channel) {
+	case ANIMCHANNEL_HEAD:
+		currentHeadAnim = anim;
 		headAnim.idleAnim = false;
-		headAnim.CycleAnim( anim );
+		headAnim.CycleAnim(anim);
 		flags = headAnim.GetAnimFlags();
-		if ( !flags.prevent_idle_override ) {
-			if ( torsoAnim.IsIdle() && legsAnim.IsIdle() ) {
+		if (!flags.prevent_idle_override) {
+			if (torsoAnim.IsIdle() && legsAnim.IsIdle()) {
 				torsoAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames );
+				SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames);
 				legsAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames );
+				SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames);
 			}
 		}
 		break;
 
-	case ANIMCHANNEL_TORSO :
+	case ANIMCHANNEL_TORSO:
+		currentTorsoAnim = anim;
 		torsoAnim.idleAnim = false;
-		torsoAnim.CycleAnim( anim );
+		torsoAnim.CycleAnim(anim);
 		flags = torsoAnim.GetAnimFlags();
-		if ( !flags.prevent_idle_override ) {
-			if ( headAnim.IsIdle() ) {
+		if (!flags.prevent_idle_override) {
+			if (headAnim.IsIdle()) {
 				headAnim.animBlendFrames = torsoAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames );
+				SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames);
 			}
-			if ( legsAnim.IsIdle() ) {
+			if (legsAnim.IsIdle()) {
 				legsAnim.animBlendFrames = torsoAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames );
+				SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames);
 			}
 		}
 		break;
 
-	case ANIMCHANNEL_LEGS :
+	case ANIMCHANNEL_LEGS:
+		currentLegsAnim = anim;
 		legsAnim.idleAnim = false;
-		legsAnim.CycleAnim( anim );
+		legsAnim.CycleAnim(anim);
 		flags = legsAnim.GetAnimFlags();
-		if ( !flags.prevent_idle_override ) {
-			if ( torsoAnim.IsIdle() ) {
+		if (!flags.prevent_idle_override) {
+			if (torsoAnim.IsIdle()) {
 				torsoAnim.animBlendFrames = legsAnim.lastAnimBlendFrames;
-				SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames );
-				if ( headAnim.IsIdle() ) {
+				SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames);
+				if (headAnim.IsIdle()) {
 					headAnim.animBlendFrames = legsAnim.lastAnimBlendFrames;
-					SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames );
+					SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames);
 				}
 			}
 		}
 		break;
 
 	default:
-		gameLocal.Error( "Unknown anim group" );
+		gameLocal.Error("Unknown anim group");
 	}
-
-	idThread::ReturnInt( true );
 }
+
 
 /*
 ===============
@@ -2828,75 +2992,98 @@ void idActor::Event_IdleAnim( int channel, const char *animname ) {
 		return;
 	}
 
-	switch( channel ) {
-	case ANIMCHANNEL_HEAD :
+	PlayIdleID(channel, anim);
+
+	idThread::ReturnInt( true );
+}
+
+/*
+===============
+idActor::PlayIdleID
+===============
+*/
+void idActor::PlayIdleID(int channel, int anim) {
+
+	currentAnimType = ACTOR_ANIM_IDLE;
+
+	switch (channel) {
+	case ANIMCHANNEL_HEAD:
+		currentHeadAnim = anim;
 		headAnim.BecomeIdle();
-		if ( torsoAnim.GetAnimFlags().prevent_idle_override ) {
+		if (torsoAnim.GetAnimFlags().prevent_idle_override) {
 			// don't sync to torso body if it doesn't override idle anims
-			headAnim.CycleAnim( anim );
-		} else if ( torsoAnim.IsIdle() && legsAnim.IsIdle() ) {
+			headAnim.CycleAnim(anim);
+		}
+		else if (torsoAnim.IsIdle() && legsAnim.IsIdle()) {
 			// everything is idle, so play the anim on the head and copy it to the torso and legs
-			headAnim.CycleAnim( anim );
+			headAnim.CycleAnim(anim);
 			torsoAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-			SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames );
+			SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames);
 			legsAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-			SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames );
-		} else if ( torsoAnim.IsIdle() ) {
+			SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_HEAD, headAnim.lastAnimBlendFrames);
+		}
+		else if (torsoAnim.IsIdle()) {
 			// sync the head and torso to the legs
-			SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, headAnim.animBlendFrames );
+			SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, headAnim.animBlendFrames);
 			torsoAnim.animBlendFrames = headAnim.lastAnimBlendFrames;
-			SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, torsoAnim.animBlendFrames );
-		} else {
+			SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, torsoAnim.animBlendFrames);
+		}
+		else {
 			// sync the head to the torso
-			SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, headAnim.animBlendFrames );
+			SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, headAnim.animBlendFrames);
 		}
 		break;
 
-	case ANIMCHANNEL_TORSO :
+	case ANIMCHANNEL_TORSO:
+		currentTorsoAnim = anim;
 		torsoAnim.BecomeIdle();
-		if ( legsAnim.GetAnimFlags().prevent_idle_override ) {
+		if (legsAnim.GetAnimFlags().prevent_idle_override) {
 			// don't sync to legs if legs anim doesn't override idle anims
-			torsoAnim.CycleAnim( anim );
-		} else if ( legsAnim.IsIdle() ) {
+			torsoAnim.CycleAnim(anim);
+		}
+		else if (legsAnim.IsIdle()) {
 			// play the anim in both legs and torso
-			torsoAnim.CycleAnim( anim );
+			torsoAnim.CycleAnim(anim);
 			legsAnim.animBlendFrames = torsoAnim.lastAnimBlendFrames;
-			SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames );
-		} else {
+			SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames);
+		}
+		else {
 			// sync the anim to the legs
-			SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, torsoAnim.animBlendFrames );
+			SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, torsoAnim.animBlendFrames);
 		}
 
-		if ( headAnim.IsIdle() ) {
-			SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames );
+		if (headAnim.IsIdle()) {
+			SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_TORSO, torsoAnim.lastAnimBlendFrames);
 		}
 		break;
 
-	case ANIMCHANNEL_LEGS :
+	case ANIMCHANNEL_LEGS:
+		currentLegsAnim = anim;
 		legsAnim.BecomeIdle();
-		if ( torsoAnim.GetAnimFlags().prevent_idle_override ) {
+		if (torsoAnim.GetAnimFlags().prevent_idle_override) {
 			// don't sync to torso if torso anim doesn't override idle anims
-			legsAnim.CycleAnim( anim );
-		} else if ( torsoAnim.IsIdle() ) {
+			legsAnim.CycleAnim(anim);
+		}
+		else if (torsoAnim.IsIdle()) {
 			// play the anim in both legs and torso
-			legsAnim.CycleAnim( anim );
+			legsAnim.CycleAnim(anim);
 			torsoAnim.animBlendFrames = legsAnim.lastAnimBlendFrames;
-			SyncAnimChannels( ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames );
-			if ( headAnim.IsIdle() ) {
-				SyncAnimChannels( ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames );
+			SyncAnimChannels(ANIMCHANNEL_TORSO, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames);
+			if (headAnim.IsIdle()) {
+				SyncAnimChannels(ANIMCHANNEL_HEAD, ANIMCHANNEL_LEGS, legsAnim.lastAnimBlendFrames);
 			}
-		} else {
+		}
+		else {
 			// sync the anim to the torso
-			SyncAnimChannels( ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, legsAnim.animBlendFrames );
+			SyncAnimChannels(ANIMCHANNEL_LEGS, ANIMCHANNEL_TORSO, legsAnim.animBlendFrames);
 		}
 		break;
 
 	default:
-		gameLocal.Error( "Unknown anim group" );
+		gameLocal.Error("Unknown anim group");
 	}
-
-	idThread::ReturnInt( true );
 }
+
 
 /*
 ================
@@ -3347,6 +3534,37 @@ idActor::Event_GetHead
 void idActor::Event_GetHead( void ) {
 	idThread::ReturnEntity( head.GetEntity() );
 }
+
+/*
+================
+idActor::ServerReceiveEvent
+================
+*/
+bool idActor::ServerReceiveEvent( int event, int time, const idBitMsg &msg ) {
+
+	// client->server events
+	switch( event ) {
+		case EVENT_CLIENTDAMAGE: {
+			int clientEntityNum, damageToInflict, location;
+			idVec3 tmpDir = vec3_zero;
+
+			clientEntityNum = msg.ReadBits(idMath::BitsForInteger(MAX_CLIENTS));
+			damageToInflict = msg.ReadShort();
+			location = msg.ReadShort();
+			tmpDir.x = msg.ReadFloat();
+			tmpDir.y = msg.ReadFloat();
+			tmpDir.z = msg.ReadFloat();
+
+			if (clientEntityNum >= 0 && clientEntityNum < MAX_CLIENTS && gameLocal.entities[clientEntityNum] && gameLocal.entities[clientEntityNum]->IsType(idPlayer::Type)) {
+				lastPlayerDamage = gameLocal.entities[clientEntityNum];
+			}
+
+			ClientReceivedDamage(NULL, lastPlayerDamage, tmpDir, damageToInflict, location);
+		}
+	}
+
+	return idEntity::ServerReceiveEvent( event, time, msg );
+} 
 
 #ifdef _D3XP
 /*

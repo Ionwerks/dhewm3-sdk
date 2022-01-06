@@ -68,6 +68,8 @@ public :
 	void					Event_SetGravity( float gravity );
 #endif
 
+
+	virtual void			SpawnDebris( void ); //added for COOP Clientside code
 	virtual void			Think( void );
 	virtual void			Killed( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location );
 	virtual bool			Collide( const trace_t &collision, const idVec3 &velocity );
@@ -81,6 +83,11 @@ public :
 		EVENT_DAMAGE_EFFECT = idEntity::EVENT_MAXEVENTS,
 		EVENT_MAXEVENTS
 	};
+
+	void					SetLaunchedFromGrabber( bool bl ) { launchedFromGrabber = bl; } //Added for LM
+	bool					GetLaunchedFromGrabber() { return launchedFromGrabber; } //Added for LM
+
+	bool					selfClientside; //if this projectile should be allowed to be self Clientside
 
 	static void				DefaultDamageEffect( idEntity *soundEnt, const idDict &projectileDef, const trace_t &collision, const idVec3 &velocity );
 	static bool				ClientPredictionCollide( idEntity *soundEnt, const idDict &projectileDef, const trace_t &collision, const idVec3 &velocity, bool addDamageEffect );
@@ -100,6 +107,8 @@ protected:
 		bool				noSplashDamage				: 1;
 	} projectileFlags;
 
+	bool					launchedFromGrabber; //Added for LM
+
 	float					thrust;
 	int						thrust_end;
 	float					damagePower;
@@ -116,6 +125,9 @@ protected:
 
 	const idDeclParticle *	smokeFly;
 	int						smokeFlyTime;
+
+	bool					mNoExplodeDisappear; //Added for LM
+	bool					mTouchTriggers;  //Added for LM
 
 #ifdef _D3XP
 	int						originalTimeGroup;
@@ -134,6 +146,8 @@ protected:
 
 private:
 	bool					netSyncPhysics;
+
+	bool					CanDoDamage(idEntity* victim);
 
 	void					AddDefaultDamageEffect( const trace_t &collision, const idVec3 &velocity );
 
@@ -161,6 +175,10 @@ public :
 	void					SetEnemy( idEntity *ent );
 	void					Event_SetEnemy(idEntity *ent);
 #endif
+
+	virtual void			ClientPredictionThink( void ); //added for Coop
+	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const; //added for Coop
+	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg ); //added for Coop
 
 protected:
 	float					speed;
@@ -190,6 +208,10 @@ public:
 	void					Spawn( void );
 	virtual void			Think( void );
 	virtual void			Launch( const idVec3 &start, const idVec3 &dir, const idVec3 &pushVelocity, const float timeSinceFire = 0.0f, const float power = 1.0f, const float dmgPower = 1.0f );
+
+	virtual void			ClientPredictionThink( void ); //added for Coop
+	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const; //added for Coop
+	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg ); //added for Coop
 
 protected:
 	virtual void			GetSeekPos( idVec3 &out );
@@ -243,6 +265,45 @@ private:
 	void					ApplyDamage();
 };
 
+
+//Added for LM
+
+class idHomingProjectile : public idProjectile {
+public :
+	CLASS_PROTOTYPE( idHomingProjectile );
+
+	idHomingProjectile();
+	~idHomingProjectile();
+
+	void					Save( idSaveGame *savefile ) const;
+	void					Restore( idRestoreGame *savefile );
+
+	void					Spawn();
+	virtual void			Think();
+	virtual void			Launch( const idVec3 &start, const idVec3 &dir, const idVec3 &pushVelocity, const float timeSinceFire = 0.0f, const float launchPower = 1.0f, const float dmgPower = 1.0f );
+	void					SetEnemy( idEntity *ent );
+	void					SetSeekPos( idVec3 pos );
+	void					Event_SetEnemy(idEntity *ent);
+
+protected:
+	float					speed;
+	idEntityPtr<idEntity>	enemy;
+	idVec3					seekPos;
+
+private:
+	idAngles				rndScale;
+	idAngles				rndAng;
+	idAngles				angles;
+	float					turn_max;
+	float					clamp_dist;
+	bool					burstMode;
+	bool					unGuided;
+	float					burstDist;
+	float					burstVelocity;
+};
+
+//end for LM
+
 /*
 ===============================================================================
 
@@ -271,6 +332,7 @@ public :
 	void					Explode( void );
 	void					Fizzle( void );
 	virtual bool			Collide( const trace_t &collision, const idVec3 &velocity );
+	virtual void			ClientPredictionThink( void ); //added for Coop
 
 
 private:

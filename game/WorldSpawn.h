@@ -50,6 +50,9 @@ public:
 	void			Save( idRestoreGame *savefile );
 	void			Restore( idRestoreGame *savefile );
 
+	// added for coop
+	void			InitializateMapScript( void );
+
 private:
 	void			Event_Remove( void );
 };

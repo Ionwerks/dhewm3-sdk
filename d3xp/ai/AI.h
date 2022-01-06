@@ -109,8 +109,17 @@ typedef enum {
 	MOVE_STATUS_BLOCKED_BY_WALL,
 	MOVE_STATUS_BLOCKED_BY_OBJECT,
 	MOVE_STATUS_BLOCKED_BY_ENEMY,
-	MOVE_STATUS_BLOCKED_BY_MONSTER
+	MOVE_STATUS_BLOCKED_BY_MONSTER,
+	NUM_MOVE_STATUS
 } moveStatus_t;
+
+//ADDED FOR COOP by Stradex
+typedef enum {
+	NETACTION_NONE,
+	NETACTION_HIDE,
+	NETACTION_SHOW,
+	NETACTION_OVERRIDEANIM
+} netActionType_t;
 
 #define	DI_NODIR	-1
 
@@ -263,6 +272,12 @@ class idAI : public idActor {
 public:
 	CLASS_PROTOTYPE( idAI );
 
+	enum {
+		EVENT_CLIENTKILL = idActor::EVENT_MAXEVENTS,
+		EVENT_RESURRECTED,
+		EVENT_MAXEVENTS
+	};
+
 							idAI();
 							~idAI();
 
@@ -292,6 +307,21 @@ public:
 	static bool				TestTrajectory( const idVec3 &start, const idVec3 &end, float zVel, float gravity, float time, float max_height, const idClipModel *clip, int clipmask, const idEntity *ignore, const idEntity *targetEntity, int drawtime );
 							// Finds the best collision free trajectory for a clip model.
 	static bool				PredictTrajectory( const idVec3 &firePos, const idVec3 &target, float projectileSpeed, const idVec3 &projGravity, const idClipModel *clip, int clipmask, float max_height, const idEntity *ignore, const idEntity *targetEntity, int drawtime, idVec3 &aimDir );
+
+	virtual void			ClientPredictionThink( void ); //Added for COOP by Stradex
+	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const;  //Added for COOP by Stradex
+	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg );  //Added for COOP by Stradex
+	virtual bool			ServerReceiveEvent( int event, int time, const idBitMsg &msg ); //Added for COOP by Stradex
+	virtual bool			ClientReceiveEvent( int event, int time, const idBitMsg &msg ); //Added for COOP by Stradex
+	void					WriteAnimToSnapshot(idBitMsgDelta& msg) const;
+	void					ReadAnimFromSnapshot(const idBitMsgDelta& msg);
+	void					ClientProcessNetAction(netActionType_t newAction);  //Added for COOP by Stradex
+	idPlayer				*GetClosestPlayerEnemy( void );
+	idPlayer				*GetClosestPlayer( void );
+	idPlayer				*GetFocusPlayer( void ); //for coop with characters AI
+
+	void					TriggerWeaponEffects( const idVec3 &muzzle ); //moved to public by Stradex for COOP
+	void					Init_CoopScriptFix( void ); //dirty hack for coop fix
 
 #ifdef _D3XP
 	virtual void			Gib( const idVec3 &dir, const char *damageDefName );
@@ -359,6 +389,8 @@ protected:
 	idVec3					projectileGravity;
 	idEntityPtr<idProjectile> projectile;
 	idStr					attack;
+	//Added for the LM
+	idVec3					homingMissileGoal;
 
 	// chatter/talking
 	const idSoundShader		*chat_snd;
@@ -419,6 +451,22 @@ protected:
 	idVec3					lastReachableEnemyPos;
 	bool					wakeOnFlashlight;
 
+	//Added for coop by Stradex
+	int						lastDamageDef;
+	idVec3					lastDamageDir;
+	int						lastDamageLocation;
+	netActionType_t			currentNetAction;
+	idStr					currentVoiceSND;
+	idStr					currentDamageSND;
+	bool					haveModelDeath; //FIXME: I only exists to avoid a crash
+	idVec3					turnTowardPos; 
+	bool					thereWasEnemy;
+	int						currentChannelOverride;
+	int						currentAttackDefNum;
+	int						oldHealth; // To check if an entity was resurrected to inform the client about it (used in conjunction with g_clientsideDamage)
+	bool					allowFastMonsters; // Some entities maybe don't work correctly while using g_fastMonsters
+
+
 #ifdef _D3XP
 	bool					spawnClearMoveables;
 
@@ -467,6 +515,7 @@ protected:
 	idVec3					FirstVisiblePointOnPath( const idVec3 origin, const idVec3 &target, int travelFlags ) const;
 	void					CalculateAttackOffsets( void );
 	void					PlayCinematic( void );
+	void					LinkScriptVariables( void );
 
 	// movement
 	virtual void			ApplyImpulse( idEntity *ent, int id, const idVec3 &point, const idVec3 &impulse );
@@ -483,6 +532,13 @@ protected:
 	void					FlyTurn( void );
 	void					FlyMove( void );
 	void					StaticMove( void );
+
+	//client-side movement for Coop
+	void					CSAnimMove( void );
+	void					CSKilled( void );
+	void					CSResurrected( void ); //hack for coop (I don't like this because it is too specific for doom 3 only :( )
+	void					CSProcessAnimations(int newTorsoAnimId, int newHeadAnimId, int newLegsAnimId, int newAnimType, bool cinematic);
+	void					Event_OverrideAnim( int channel ); //for netaction
 
 	// damage
 	virtual bool			Pain( idEntity *inflictor, idEntity *attacker, int damage, const idVec3 &dir, int location );
@@ -540,8 +596,9 @@ protected:
 	idProjectile			*CreateProjectile( const idVec3 &pos, const idVec3 &dir );
 	void					RemoveProjectile( void );
 	idProjectile			*LaunchProjectile( const char *jointname, idEntity *target, bool clampToAttackCone );
+	idProjectile			*CS_LaunchProjectile( idVec3 muzzle, idVec3 inidir, idEntity *target, bool clampToAttackCone ); //Launch projectile clientside while using g_clientsideDamage 1
 	virtual void			DamageFeedback( idEntity *victim, idEntity *inflictor, int &damage );
-	void					DirectDamage( const char *meleeDefName, idEntity *ent );
+	void					DirectDamage( const char *meleeDefName, idEntity *ent, const bool canBeClientDamage = false);
 	bool					TestMelee( void ) const;
 	bool					AttackMelee( const char *meleeDefName );
 	void					BeginAttack( const char *name );
@@ -551,7 +608,6 @@ protected:
 	// special effects
 	void					GetMuzzle( const char *jointname, idVec3 &muzzle, idMat3 &axis );
 	void					InitMuzzleFlash( void );
-	void					TriggerWeaponEffects( const idVec3 &muzzle );
 	void					UpdateMuzzleFlash( void );
 	virtual bool			UpdateAnimationControllers( void );
 	void					UpdateParticles( void );
@@ -565,7 +621,6 @@ protected:
 #endif
 
 	// AI script state management
-	void					LinkScriptVariables( void );
 	void					UpdateAIScript( void );
 
 	//
@@ -586,6 +641,9 @@ protected:
 	void					Event_FireMissileAtTarget( const char *jointname, const char *targetname );
 	void					Event_LaunchMissile( const idVec3 &muzzle, const idAngles &ang );
 #ifdef _D3XP
+	
+	void					Event_LaunchHomingMissile(); //Added for the LM
+	void					Event_SetHomingMissileGoal(); //Added for the LM
 	void					Event_LaunchProjectile( const char *entityDefName );
 #endif
 	void					Event_AttackMelee( const char *meleeDefName );

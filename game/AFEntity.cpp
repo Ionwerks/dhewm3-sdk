@@ -377,8 +377,7 @@ Pass damage to body at the bindjoint
 ============
 */
 void idAFAttachment::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir,
-	const char *damageDefName, const float damageScale, const int location ) {
-
+	const char *damageDefName, const float damageScale, const int location, const bool canBeClientDamage) {
 	if ( body ) {
 		body->Damage( inflictor, attacker, dir, damageDefName, damageScale, attachJoint );
 	}
@@ -1108,6 +1107,10 @@ void idAFEntity_Gibbable::SpawnGibs( const idVec3 &dir, const char *damageDefNam
 	idVec3 entityCenter, velocity;
 	idList<idEntity *> list;
 
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+		return; //avoid crash in coop.. kind of
+	}
+
 	assert( !gameLocal.isClient );
 
 	const idDict *damageDef = gameLocal.FindEntityDefDict( damageDefName );
@@ -1155,12 +1158,16 @@ void idAFEntity_Gibbable::Gib( const idVec3 &dir, const char *damageDefName ) {
 		return;
 	}
 
-	const idDict *damageDef = gameLocal.FindEntityDefDict( damageDefName );
-	if ( !damageDef ) {
+	const idDict *damageDef = NULL;
+
+	if (damageDefName) {
+		damageDef = gameLocal.FindEntityDefDict( damageDefName );
+	}
+	if ( !damageDef  && !gameLocal.mpGame.IsGametypeCoopBased()) {
 		gameLocal.Error( "Unknown damageDef '%s'", damageDefName );
 	}
 
-	if ( damageDef->GetBool( "gibNonSolid" ) ) {
+	if ( damageDef && damageDef->GetBool( "gibNonSolid" ) ) {
 		GetAFPhysics()->SetContents( 0 );
 		GetAFPhysics()->SetClipMask( 0 );
 		GetAFPhysics()->UnlinkClip();
@@ -1172,10 +1179,12 @@ void idAFEntity_Gibbable::Gib( const idVec3 &dir, const char *damageDefName ) {
 
 	UnlinkCombat();
 
-	if ( g_bloodEffects.GetBool() ) {
+	if ( g_bloodEffects.GetBool() && !gameLocal.mpGame.IsGametypeCoopBased() ) { //unable to spawn gibs yet in coop
 		if ( gameLocal.time > gameLocal.GetGibTime() ) {
 			gameLocal.SetGibTime( gameLocal.time + GIB_DELAY );
-			SpawnGibs( dir, damageDefName );
+			if (damageDef) {
+				SpawnGibs( dir, damageDefName );
+			}
 			renderEntity.noShadow = true;
 			renderEntity.shaderParms[ SHADERPARM_TIME_OF_DEATH ] = gameLocal.time * 0.001f;
 			StartSound( "snd_gibbed", SND_CHANNEL_ANY, 0, false, NULL );
@@ -1353,8 +1362,8 @@ idAFEntity_WithAttachedHead::Spawn
 ================
 */
 void idAFEntity_WithAttachedHead::Spawn( void ) {
-	SetupHead();
 
+	SetupHead();
 	LoadAF();
 
 	SetCombatModel();
@@ -1409,14 +1418,25 @@ void idAFEntity_WithAttachedHead::SetupHead( void ) {
 	idMat3				axis;
 
 	headModel = spawnArgs.GetString( "def_head", "" );
+
 	if ( headModel[ 0 ] ) {
 		jointName = spawnArgs.GetString( "head_joint" );
 		joint = animator.GetJointHandle( jointName );
 		if ( joint == INVALID_JOINT ) {
 			gameLocal.Error( "Joint '%s' not found for 'head_joint' on '%s'", jointName.c_str(), name.c_str() );
 		}
+		idDict	args;
+		args.Clear();
 
-		headEnt = static_cast<idAFAttachment *>( gameLocal.SpawnEntityType( idAFAttachment::Type, NULL ) );
+		if (gameLocal.mpGame.IsGametypeCoopBased()) {
+			if (isMapEntity) {
+				args.Set("mapEntity", "1"); //if the body is a map entity, then set the head to be one too
+			} else if (!fl.coopNetworkSync) {
+				args.Set("clientside", "1");
+			}
+		}
+
+		headEnt = static_cast<idAFAttachment *>( gameLocal.SpawnEntityType( idAFAttachment::Type, &args, true ) );
 		headEnt->SetName( va( "%s_head", name.c_str() ) );
 		headEnt->SetBody( this, headModel, joint );
 		headEnt->SetCombatModel();

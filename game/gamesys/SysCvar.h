@@ -247,10 +247,33 @@ extern idCVar	si_gameType;
 extern idCVar	si_map;
 extern idCVar	si_spectators;
 
+//fluff start (Thanks fluff :3)
+extern idCVar	si_itemRespawn; // added for coop
+//fluff end
+
+//stradex start
+extern idCVar	g_unblockPlayers; //if players are solid between them or not
+extern idCVar	si_onePickupPerPlayer;
+extern idCVar	net_clientCoopDebug; //added for debug stuff only
+extern idCVar	net_clientShowSnapshotType;
+extern idCVar	net_serverSnapshotLimit; //how many entities are we able to send per snapshot as server (avoid snapshot overflow, something common in big coop maps)
+extern idCVar	si_lives; //survival lives
+extern idCVar	net_clientSideMovement; //added by Stradex (experimental, works only with high ping)
+extern idCVar	g_spawnInCheckpoints; //Allow players to spawn in librecoop checkpoints system
+extern idCVar	g_keepItemsAfterRespawn; //Allow players to keep weapons and ammo after dying
+extern idCVar	g_clientsideDamage;	//added for COOP clientside damage
+extern idCVar	g_fastMonsters; //difficulty feature for COOP: (Experimental!) [FIXME: Maledict do not works with fast monsters!!]
+extern idCVar	g_damageFactor; //Use this instead of g_damageScale since that can change dynamically with g_useDynamicProtection
+//stradex end
+
+
 extern idCVar	net_clientSelfSmoothing;
 extern idCVar	net_clientLagOMeter;
+extern idCVar	g_mod_version;
 
 extern const char *si_gameTypeArgs[];
+
+extern const char* opencoop_gameTypes[];
 
 extern const char *ui_skinArgs[];
 

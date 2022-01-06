@@ -61,7 +61,7 @@ public:
 	virtual void		Disable( void );
 
 protected:
-	void				CallScript( void ) const;
+	void				CallScript( void );
 
 	void				Event_Enable( void );
 	void				Event_Disable( void );
@@ -142,6 +142,8 @@ private:
 	int					nextTriggerTime;
 	bool				triggerFirst;
 	idStr				entityName;
+	//added for LM
+	bool				testPartialName;
 
 	void				TriggerAction( idEntity *activator );
 	void				Event_TriggerAction( idEntity *activator );
@@ -254,6 +256,8 @@ class idTrigger_Fade : public idTrigger {
 public:
 
 	CLASS_PROTOTYPE( idTrigger_Fade );
+
+						idTrigger_Fade(void);
 
 private:
 	void				Event_Trigger( idEntity *activator );

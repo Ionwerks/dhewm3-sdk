@@ -59,6 +59,7 @@ If you have questions concerning this license or the applicable additional terms
 #define MAX_GAME_MESSAGE_SIZE	8192
 #define MAX_ENTITY_STATE_SIZE	512
 #define ENTITY_PVS_SIZE			((MAX_GENTITIES+31)>>5)
+#define CS_ENTITIES_START		(MAX_GENTITIES-1000) //added by stradex for client-side entities
 
 // content masks
 #define	MASK_ALL				(-1)
@@ -70,8 +71,14 @@ If you have questions concerning this license or the applicable additional terms
 #define	MASK_OPAQUE				(CONTENTS_OPAQUE)
 #define	MASK_SHOT_RENDERMODEL	(CONTENTS_SOLID|CONTENTS_RENDERMODEL)
 #define	MASK_SHOT_BOUNDINGBOX	(CONTENTS_SOLID|CONTENTS_BODY)
+#define	MASK_UNBLOCKPLAYER		(CONTENTS_SOLID|CONTENTS_PLAYERCLIP)
 
 #define DEFAULT_GRAVITY_STRING	"1066"
+
+// mod version info
+
+#define GAME_MOD_NAME			"Librecoop"
+#define GAME_MOD_VERSION		"alpha 1.5.02"
 
 extern void gameError( const char *fmt, ... );
 

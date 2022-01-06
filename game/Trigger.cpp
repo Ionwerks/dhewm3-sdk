@@ -27,9 +27,9 @@ If you have questions concerning this license or the applicable additional terms
 */
 
 #include "sys/platform.h"
+#include "framework/async/NetworkSystem.h" //Coop
 #include "script/Script_Thread.h"
 #include "Player.h"
-
 #include "Trigger.h"
 
 /*
@@ -139,7 +139,7 @@ void idTrigger::Disable( void ) {
 idTrigger::CallScript
 ================
 */
-void idTrigger::CallScript( void ) const {
+void idTrigger::CallScript( void ) {
 	idThread *thread;
 
 	if ( scriptFunction ) {
@@ -268,6 +268,7 @@ idTrigger_Multi::idTrigger_Multi( void ) {
 	touchOther = false;
 	triggerFirst = false;
 	triggerWithSelf = false;
+	eventSyncVital = false;
 }
 
 /*
@@ -1029,6 +1030,18 @@ CLASS_DECLARATION( idTrigger, idTrigger_Fade )
 	EVENT( EV_Activate,		idTrigger_Fade::Event_Trigger )
 END_CLASS
 
+
+/*
+================
+idTrigger_Fade::idTrigger_Fade
+================
+*/
+idTrigger_Fade::idTrigger_Fade(void) {
+	canBeCsTarget = true; //false, to avoid bug related with clients reconnecting 
+	csActivateTargetMaxDelay = 10;
+}
+
+
 /*
 ================
 idTrigger_Fade::Event_Trigger
@@ -1039,12 +1052,15 @@ void idTrigger_Fade::Event_Trigger( idEntity *activator ) {
 	int			fadeTime;
 	idPlayer	*player;
 
-	player = gameLocal.GetLocalPlayer();
+	player = gameLocal.GetCoopPlayer();
 	if ( player ) {
 		fadeColor = spawnArgs.GetVec4( "fadeColor", "0, 0, 0, 1" );
-		fadeTime = SEC2MS( spawnArgs.GetFloat( "fadeTime", "0.5" ) );
-		player->playerView.Fade( fadeColor, fadeTime );
-		PostEventMS( &EV_ActivateTargets, fadeTime, activator );
+		int secsFadeTime = spawnArgs.GetFloat("fadeTime", "0.5");
+		fadeTime = SEC2MS(secsFadeTime);
+		if (!gameLocal.mpGame.IsGametypeCoopBased()) {
+			player->playerView.Fade(fadeColor, fadeTime);
+		}
+		PostEventMS(&EV_ActivateTargets, fadeTime, activator); //server-side only
 	}
 }
 

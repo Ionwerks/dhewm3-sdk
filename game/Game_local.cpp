@@ -26,7 +26,6 @@ If you have questions concerning this license or the applicable additional terms
 ===========================================================================
 */
 
-#include "sys/Stub_SDL_endian.h"
 #include "sys/platform.h"
 #include "idlib/LangDict.h"
 #include "idlib/Timer.h"
@@ -34,12 +33,12 @@ If you have questions concerning this license or the applicable additional terms
 #include "framework/BuildVersion.h"
 #include "framework/DeclEntityDef.h"
 #include "framework/FileSystem.h"
-#include "framework/Licensee.h"
 #include "renderer/ModelManager.h"
 
 #include "gamesys/SysCvar.h"
 #include "gamesys/SysCmds.h"
 #include "script/Script_Thread.h"
+#include "Entity.h" //added for coop by Stradex
 #include "ai/AI.h"
 #include "anim/Anim_Testmodel.h"
 #include "Camera.h"
@@ -182,8 +181,11 @@ void idGameLocal::Clear( void ) {
 		userInfo[i].Clear();
 		persistentPlayerInfo[i].Clear();
 	}
+	persistentPlayerInfoClientside.Clear();
+	serverLevelInventory.Clear();
 	memset( usercmds, 0, sizeof( usercmds ) );
 	memset( entities, 0, sizeof( entities ) );
+	memset(targetentities, 0, sizeof(targetentities));
 	memset( spawnIds, -1, sizeof( spawnIds ) );
 	firstFreeIndex = 0;
 	num_entities = 0;
@@ -212,6 +214,7 @@ void idGameLocal::Clear( void ) {
 	cinematicMaxSkipTime = 0;
 	framenum = 0;
 	previousTime = 0;
+	previousClientsideTime = 0;
 	time = 0;
 	vacuumAreaNum = 0;
 	mapFileName.Clear();
@@ -246,6 +249,35 @@ void idGameLocal::Clear( void ) {
 	lastGUIEnt = NULL;
 	lastGUI = 0;
 
+	//added for coop
+	firstFreeCoopIndex = 0;  //added for coop
+	firstFreeTargetIndex = 0;  //added for coop
+	num_coopentities = 0;  //added for coop
+	num_removeSyncEntities = 0; //added for coop
+	coopSyncEntities.Clear(); //added for coop
+	coopCount = INITIAL_SPAWN_COUNT; //added by Stradex
+	mapCoopCount = 0;  //added by Stradex
+
+	memset(coopentities, 0, sizeof(coopentities)); //added for coop
+	memset(removeSyncEntities, 0, sizeof(removeSyncEntities)); //added for coop
+	memset(coopIds, -1, sizeof(coopIds));
+
+	isRestartingMap = false;
+	spPlayerStartSpot.ent = NULL;
+	firstClientToSpawn = false;
+	coopMapScriptLoad = false;
+	serverEventsCount=0;
+	clientEventsCount=0;
+	for (int i=0; i < SERVER_EVENTS_QUEUE_SIZE; i++) {
+		serverOverflowEvents[i].eventEnt = NULL;
+		serverOverflowEvents[i].eventId = SERVER_EVENT_NONE;
+		serverOverflowEvents[i].isEventType = false;
+		serverOverflowEvents[i].event = NULL;
+	}
+	overflowEventCountdown=0;
+	clientsideTime = 0;
+	//end for coop
+
 	memset( clientEntityStates, 0, sizeof( clientEntityStates ) );
 	memset( clientPVS, 0, sizeof( clientPVS ) );
 	memset( clientSnapshots, 0, sizeof( clientSnapshots ) );
@@ -254,6 +286,7 @@ void idGameLocal::Clear( void ) {
 	savedEventQueue.Init();
 
 	memset( lagometer, 0, sizeof( lagometer ) );
+	clientsideEntities.Clear();
 }
 
 /*
@@ -429,15 +462,6 @@ void idGameLocal::SaveGame( idFile *f ) {
 
 	savegame.WriteBuildNumber( BUILD_NUMBER );
 
-	// DG: add some more information to savegame to make future quirks easier
-	savegame.WriteInt( INTERNAL_SAVEGAME_VERSION ); // to be independent of BUILD_NUMBER
-	savegame.WriteString( D3_OSTYPE ); // operating system - from CMake
-	savegame.WriteString( D3_ARCH ); // CPU architecture (e.g. "x86" or "x86_64") - from CMake
-	savegame.WriteString( ENGINE_VERSION );
-	savegame.WriteShort( (short)sizeof(void*) ); // tells us if it's from a 32bit (4) or 64bit system (8)
-	savegame.WriteShort( SDL_BYTEORDER ) ; // SDL_LIL_ENDIAN or SDL_BIG_ENDIAN
-	// DG end
-
 	// go through all entities and threads and add them to the object list
 	for( i = 0; i < MAX_GENTITIES; i++ ) {
 		ent = entities[i];
@@ -610,6 +634,29 @@ const idDict &idGameLocal::GetPersistentPlayerInfo( int clientNum ) {
 	return persistentPlayerInfo[ clientNum ];
 }
 
+
+
+
+/*
+===========
+idGameLocal::CS_SavePersistentPlayerInfo
+============
+*/
+const idDict &idGameLocal::CS_SavePersistentPlayerInfo( void ) {
+
+	assert(this->isClient && localClientNum >= 0);
+
+	idEntity	*ent;
+
+	persistentPlayerInfoClientside.Clear();
+	ent = entities[ localClientNum ];
+	if ( ent && ent->IsType( idPlayer::Type ) ) {
+		static_cast<idPlayer *>(ent)->CS_SavePersistantInfo();
+	}
+
+	return persistentPlayerInfoClientside;
+}
+
 /*
 ===========
 idGameLocal::SetPersistentPlayerInfo
@@ -619,6 +666,53 @@ void idGameLocal::SetPersistentPlayerInfo( int clientNum, const idDict &playerIn
 	persistentPlayerInfo[ clientNum ] = playerInfo;
 }
 
+/*
+===========
+idGameLocal::SaveGlobalInventory
+============
+*/
+
+void idGameLocal::SaveGlobalInventory( idDict* item ) {
+	int itemsCount = serverLevelInventory.Num();
+	int i;
+	for (i = 0; i < itemsCount; i++) {
+		if (idStr::Icmp(item->GetString("inv_name"), serverLevelInventory[i]->GetString("inv_name")) == 0) {
+			return;
+		}
+	}
+	serverLevelInventory.Append(new idDict(*item));
+}
+
+/*
+===========
+idGameLocal::LoadGlobalInventory
+============
+*/
+
+void idGameLocal::LoadGlobalInventory(int clientNum) {
+	if (clientNum < 0 || clientNum > MAX_CLIENTS) {
+		return;
+	}
+	if (!entities[clientNum] || !entities[clientNum]->IsType(idPlayer::Type)) {
+		return;
+	}
+
+	idPlayer* p = static_cast<idPlayer*>(entities[clientNum]);
+	bool oldSpectating = p->spectating; //HACK to be able to give inventory to player even while spectating
+	p->spectating = false;
+	int itemsCount = serverLevelInventory.Num();
+	int i;
+	for (i = 0; i < itemsCount; i++) {
+		const char* pdaNameStr = serverLevelInventory[i]->GetString("pda_name");
+		if (pdaNameStr == NULL || *pdaNameStr == 0) { //key or other stuff
+			p->GiveInventoryItem(serverLevelInventory[i]);
+		} else { // pda security
+			p->inventory.pdaSecurity.AddUnique(serverLevelInventory[i]->GetString("inv_name"));
+		}
+	}
+	p->spectating = oldSpectating; //end hack
+
+}
 /*
 ============
 idGameLocal::Printf
@@ -653,6 +747,24 @@ void idGameLocal::DPrintf( const char *fmt, ... ) const {
 	va_end( argptr );
 
 	common->Printf( "%s", text );
+}
+
+/*
+============
+idGameLocal::DebugPrintf
+============
+*/
+void idGameLocal::DebugPrintf( const char *fmt, ... ) const {
+#ifdef _DEBUG
+	va_list		argptr;
+	char		text[MAX_STRING_CHARS];
+
+	va_start( argptr, fmt );
+	idStr::vsnPrintf( text, sizeof( text ), fmt, argptr );
+	va_end( argptr );
+
+	common->Printf( "[DEBUG] %s", text );
+#endif
 }
 
 /*
@@ -880,8 +992,11 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
 	memset( entities, 0, sizeof( entities ) );
 	memset( usercmds, 0, sizeof( usercmds ) );
 	memset( spawnIds, -1, sizeof( spawnIds ) );
+	memset( coopIds, -1, sizeof( coopIds ) );
 	spawnCount = INITIAL_SPAWN_COUNT;
+	coopCount =  INITIAL_SPAWN_COUNT; //added for Coop by Stradex
 
+	coopSyncEntities.Clear(); //added for Coop by Stradex
 	spawnedEntities.Clear();
 	activeEntities.Clear();
 	numEntitiesToDeactivate = 0;
@@ -898,7 +1013,12 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
 	// even if they aren't all used, so numbers inside that
 	// range are NEVER anything but clients
 	num_entities	= MAX_CLIENTS;
+	num_coopentities = MAX_CLIENTS;
+	num_removeSyncEntities = 0; //added for coop
 	firstFreeIndex	= MAX_CLIENTS;
+	firstFreeCoopIndex = MAX_CLIENTS; //added for Coop
+	firstFreeTargetIndex = MAX_CLIENTS; //added for Coop
+	firstFreeCsIndex = CS_ENTITIES_START; //added for Coop
 
 	// reset the random number generator.
 	random.SetSeed( isMultiplayer ? randseed : 0 );
@@ -912,6 +1032,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
 	lastAIAlertTime = 0;
 
 	previousTime	= 0;
+	previousClientsideTime = 0;
 	time			= 0;
 	framenum		= 0;
 	sessionCommand = "";
@@ -960,21 +1081,41 @@ idGameLocal::LocalMapRestart
 ===================
 */
 void idGameLocal::LocalMapRestart( ) {
-	int i, latchSpawnCount;
+	int i, latchSpawnCount, latchCoopCount;
 
 	Printf( "----- Game Map Restart -----\n" );
 
+	isRestartingMap = true; //COOP
+
 	gamestate = GAMESTATE_SHUTDOWN;
+
+	if (mpGame.IsGametypeCoopBased()) {
+		SetCamera(NULL);
+	}
 
 	for ( i = 0; i < MAX_CLIENTS; i++ ) {
 		if ( entities[ i ] && entities[ i ]->IsType( idPlayer::Type ) ) {
 			static_cast< idPlayer * >( entities[ i ] )->PrepareForRestart();
 		}
+		coopentities[i] = entities[ i ]; //fix?
 	}
 
 	eventQueue.Shutdown();
 	savedEventQueue.Shutdown();
 
+	for (int i=0; i < SERVER_EVENTS_QUEUE_SIZE; i++) {
+		serverOverflowEvents[i].eventEnt = NULL;
+		serverOverflowEvents[i].eventId = SERVER_EVENT_NONE;
+		serverOverflowEvents[i].isEventType = false;
+		serverOverflowEvents[i].event = NULL;
+	}
+
+	// Nicemice: temporary fix for entity synchronisation bug
+	// when restarting a map, this bug should be passed to id
+	// since it effects deathmatch maps also
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		memset(clientEntityStates, 0, sizeof(clientEntityStates));
+	}
 	MapClear( false );
 
 	// clear the smoke particle free list
@@ -990,26 +1131,112 @@ void idGameLocal::LocalMapRestart( ) {
 	latchSpawnCount = spawnCount;
 	spawnCount = INITIAL_SPAWN_COUNT;
 
+	latchCoopCount = coopCount; //added by Stradex for coop
+	coopCount = INITIAL_SPAWN_COUNT; //added by Stradex for coop
+
 	gamestate = GAMESTATE_STARTUP;
 
 	program.Restart();
 
 	InitScriptForMap();
 
+	//COOP START
+
+	firstClientToSpawn = false; //added by Stradex for coop
+	coopMapScriptLoad = false; //added by Stradex for coop
+	num_coopentities = 0; //for coop
+	num_removeSyncEntities = 0;
+
+	for (i=0; i < MAX_CLIENTS; i++) {
+		mpGame.playerUseCheckpoints[i] = false;
+		mpGame.playerCheckpoints[i] = vec3_zero;
+		if (gameLocal.mpGame.IsGametypeCoopBased()) {
+			if (entities[ i ]) {
+				program.SetEntity( entities[ i ]->name.c_str(), NULL );
+			} else {
+				program.SetEntity( va("player%d", i), NULL );
+			}
+		}
+	}
+	
+	
+	
+	//COOP END
 	MapPopulate();
 
 	// once the map is populated, set the spawnCount back to where it was so we don't risk any collision
 	// (note that if there are no players in the game, we could just leave it at it's current value)
 	spawnCount = latchSpawnCount;
+	coopCount = latchCoopCount; //added by Stradex for coop
 
 	// setup the client entities again
 	for ( i = 0; i < MAX_CLIENTS; i++ ) {
 		if ( entities[ i ] && entities[ i ]->IsType( idPlayer::Type ) ) {
 			static_cast< idPlayer * >( entities[ i ] )->Restart();
 		}
+		coopentities[i] = entities[ i ]; //fix?
 	}
 
 	gamestate = GAMESTATE_ACTIVE;
+
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		FixScriptsInMapRestart();
+		FixNoDynamicInteractions(true);
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased()) { 
+		idEvent::ServiceEvents();
+	}
+
+	isRestartingMap = false; //COOP
+}
+
+/*
+===================
+idGameLocal::FixScriptsInMapRestart
+===================
+*/
+
+void idGameLocal::FixScriptsInMapRestart( void ) {
+	world->InitializateMapScript(); //COOP, to fix a bug while doing serverMapRestart (or any kind of map restart while playing coop)
+	idEntity* ent;
+	for (ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next()) {
+		if ((ent == world) || ent->IsType(idPlayer::Type)) {
+			continue; //ignore the world entity, of course.
+		}
+		if (!ent->findTargetsAlreadyCalled) {
+			ent->Call_FindTargets();
+		}
+		if (!ent->scriptAlreadyConstructed) {
+			ent->Call_ConstructScriptObject();
+			if (ent->IsType(idAI::Type)) {
+				static_cast<idAI*>(ent)->Init_CoopScriptFix();
+			}
+		}
+	}
+}
+
+/*
+===================
+idGameLocal::FixNoDynamicInteractionsInMapRestart
+===================
+*/
+
+void idGameLocal::FixNoDynamicInteractions(bool isLocalMapRestart) {
+
+	if (gameLocal.isClient) {
+		int i, j;
+		for (i = 0; i < MAX_GENTITIES; i++) {
+			if (entities[i] && (entities[i]->IsType(idLight::Type) || entities[i]->IsType(idStaticEntity::Type))) {
+				for (j = 0; j < 3; j++) {
+					entities[i]->ClientPredictionThink();
+				}
+			}
+		}
+	}
+	if (isLocalMapRestart && gameRenderWorld && localClientNum != -1) { //fix: don't execute this in a dedicated server!, it's stupid!
+		gameRenderWorld->GenerateAllInteractions();
+	}
 }
 
 /*
@@ -1023,6 +1250,18 @@ void idGameLocal::MapRestart( ) {
 	idDict		newInfo;
 	int			i;
 	const idKeyValue *keyval, *keyval2;
+
+	//Added for COOP by Stradex
+	if ( isMultiplayer && isServer ) {
+		char buf[ MAX_STRING_CHARS ];
+		idStr gametype;
+		GetBestGameType( si_map.GetString(), si_gameType.GetString(), buf );
+		gametype = buf;
+		if ( gametype != si_gameType.GetString() ) {
+			cvarSystem->SetCVarString( "si_gameType", gametype );
+		}
+	}
+	//End
 
 	if ( isClient ) {
 		LocalMapRestart();
@@ -1147,6 +1386,11 @@ void idGameLocal::MapPopulate( void ) {
 	if ( isMultiplayer ) {
 		cvarSystem->SetCVarBool( "r_skipSpecular", false );
 	}
+	//Sync g_skill here
+
+	mapSpawnCount = 0;  //added for Coop
+	mapCoopCount = 0; //added for Coop
+
 	// parse the key/value pairs and spawn entities
 	SpawnMapEntities();
 
@@ -1160,11 +1404,17 @@ void idGameLocal::MapPopulate( void ) {
 	// mapSpawnCount is used as the max index of map entities, it's the first index of non-map entities
 	mapSpawnCount = MAX_CLIENTS + spawnCount - 1;
 
+	mapCoopCount = MAX_CLIENTS + coopCount - 1; //added for Coop
+
+	Printf("mapCoopCount: %d - mapSpawnCount: %d - num_removeSyncEntities: %d\n", mapCoopCount, mapSpawnCount, num_removeSyncEntities);
+
 	// execute pending events before the very first game frame
 	// this makes sure the map script main() function is called
 	// before the physics are run so entities can bind correctly
 	Printf( "==== Processing events ====\n" );
-	idEvent::ServiceEvents();
+	if (!gameLocal.mpGame.IsGametypeCoopBased() || !gameLocal.isRestartingMap) {
+		idEvent::ServiceEvents();
+	}
 }
 
 /*
@@ -1173,6 +1423,8 @@ idGameLocal::InitFromNewMap
 ===================
 */
 void idGameLocal::InitFromNewMap( const char *mapName, idRenderWorld *renderWorld, idSoundWorld *soundWorld, bool isServer, bool isClient, int randseed ) {
+
+	int i;
 
 	this->isServer = isServer;
 	this->isClient = isClient;
@@ -1193,6 +1445,21 @@ void idGameLocal::InitFromNewMap( const char *mapName, idRenderWorld *renderWorl
 
 	InitScriptForMap();
 
+	//COOP START
+	firstClientToSpawn = false; //added by Stradex for coop
+	coopMapScriptLoad = false; //added by Stradex for coop
+
+	for (i=0; i < MAX_CLIENTS; i++) {
+		mpGame.playerUseCheckpoints[i] = false;
+		mpGame.playerCheckpoints[i] = vec3_zero;
+	}
+	//COOP END
+
+	num_coopentities = 0; //for coop
+	num_removeSyncEntities = 0;
+
+	//Sync g_skill here!
+
 	MapPopulate();
 
 	mpGame.Reset();
@@ -1203,6 +1470,10 @@ void idGameLocal::InitFromNewMap( const char *mapName, idRenderWorld *renderWorl
 	animationLib.FlushUnusedAnims();
 
 	gamestate = GAMESTATE_ACTIVE;
+	
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		FixNoDynamicInteractions(false);
+	}
 }
 
 /*
@@ -1230,36 +1501,6 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 	idRestoreGame savegame( saveGameFile );
 
 	savegame.ReadBuildNumber();
-
-	// DG: I enhanced the information in savegames a bit for dhewm3 1.5.1
-	//     for which I bumped th BUILD_NUMBER to 1305
-	if( savegame.GetBuildNumber() >= 1305 )
-	{
-		savegame.ReadInternalSavegameVersion();
-		if( savegame.GetInternalSavegameVersion() > INTERNAL_SAVEGAME_VERSION ) {
-			Warning( "Savegame from newer dhewm3 version, don't know how to load! (its version is %d, only up to %d supported)",
-			         savegame.GetInternalSavegameVersion(), INTERNAL_SAVEGAME_VERSION );
-			return false;
-		}
-		idStr osType;
-		idStr cpuArch;
-		idStr engineVersion;
-		short ptrSize = 0;
-		short byteorder = 0;
-		savegame.ReadString( osType ); // operating system the savegame was crated on (written from D3_OSTYPE)
-		savegame.ReadString( cpuArch ); // written from D3_ARCH (which is set in CMake), like "x86" or "x86_64"
-		savegame.ReadString( engineVersion ); // written from ENGINE_VERSION
-		savegame.ReadShort( ptrSize ); // sizeof(void*) of system that created the savegame, 4 on 32bit systems, 8 on 64bit systems
-		savegame.ReadShort( byteorder ); // SDL_LIL_ENDIAN or SDL_BIG_ENDIAN
-
-		Printf( "Savegame was created by %s on %s %s. BuildNumber was %d, savegameversion %d\n",
-		        engineVersion.c_str(), osType.c_str(), cpuArch.c_str(), savegame.GetBuildNumber(),
-		        savegame.GetInternalSavegameVersion() );
-
-		// right now I have no further use for this information, but in the future
-		// it can be used for quirks for (then-) old savegames
-	}
-	// DG end
 
 	// Create the list of all objects in the game
 	savegame.CreateObjects();
@@ -1463,11 +1704,17 @@ void idGameLocal::MapClear( bool clearClients ) {
 	int i;
 
 	for( i = ( clearClients ? 0 : MAX_CLIENTS ); i < MAX_GENTITIES; i++ ) {
+		/*if (entities[i])
+		{
+			coopIds[ entities[i]->entityCoopNumber ] = -1;
+		}
+		*/
 		delete entities[ i ];
 		// ~idEntity is in charge of setting the pointer to NULL
 		// it will also clear pending events for this entity
 		assert( !entities[ i ] );
 		spawnIds[ i ] = -1;
+		coopIds[ i ] = -1;
 	}
 
 	entityHash.Clear( 1024, MAX_GENTITIES );
@@ -1492,6 +1739,34 @@ void idGameLocal::MapClear( bool clearClients ) {
 
 	delete[] locationEntities;
 	locationEntities = NULL;
+
+	//testing
+	activeEntities.Clear();
+	numEntitiesToDeactivate = 0;
+	sortTeamMasters = false;
+	sortPushers = false;
+	lastGUIEnt = NULL;
+	lastGUI = 0;
+
+	// always leave room for the max number of clients,
+	// even if they aren't all used, so numbers inside that
+	// range are NEVER anything but clients
+	num_entities	= MAX_CLIENTS;
+	num_coopentities = MAX_CLIENTS;
+	num_removeSyncEntities = 0;
+	firstFreeIndex	= MAX_CLIENTS;
+	firstFreeCoopIndex = MAX_CLIENTS; //added for Coop
+	firstFreeTargetIndex = MAX_CLIENTS; //added for Coop
+	firstFreeCsIndex = CS_ENTITIES_START; //added for Coop
+
+	lastAIAlertEntity = NULL;
+	lastAIAlertTime = 0;
+
+	nextGibTime		= 0;
+
+	vacuumAreaNum = -1;		// if an info_vacuum is spawned, it will set this
+
+	serverLevelInventory.Clear();
 }
 
 /*
@@ -1870,9 +2145,50 @@ void idGameLocal::SpawnPlayer( int clientNum ) {
 	Printf( "SpawnPlayer: %i\n", clientNum );
 
 	args.SetInt( "spawn_entnum", clientNum );
+	args.SetInt( "coop_entnum", clientNum ); //added for coop new netcode sync
+
 	args.Set( "name", va( "player%d", clientNum + 1 ) );
-	args.Set( "classname", isMultiplayer ? "player_doommarine_mp" : "player_doommarine" );
-	if ( !SpawnEntityDef( args, &ent ) || !entities[ clientNum ] ) {
+	//args.Set( "classname", isMultiplayer ? "player_doommarine_mp" : "player_doommarine" );
+	
+	if (isMultiplayer && !mpGame.IsGametypeCoopBased()) {
+		args.Set("classname", "player_doommarine_mp");
+	}
+	else if (isMultiplayer && mpGame.IsGametypeCoopBased()) {
+
+		const char* worldDefPlayer = world->spawnArgs.GetString("def_player");
+		if (gameLocal.world && (worldDefPlayer != NULL) && (worldDefPlayer[0] != '\0') && idStr::Icmp(worldDefPlayer, "player_d3xpmarine")) { // OpenCoop automatically adds the _mp to the worldspawn def_player dict
+			const idDeclEntityDef* def = FindEntityDef(worldDefPlayer, false);
+
+			if (!def) {
+				Warning("Unknown classname '%s'\n", worldDefPlayer);
+				def = FindEntityDef(va("%s_mp", worldDefPlayer), false); 
+				if (!def) {
+					Warning("Unknown classname '%s'\n", worldDefPlayer);
+					args.Set("classname", "player_doommarine_coop");
+				} else {
+					args.Set("classname", va("%s_mp", worldDefPlayer)); 
+				}
+			}else {
+				args.Set("classname", worldDefPlayer); 
+			}
+		} else {
+			args.Set("classname", "player_doommarine_coop"); //Added for COOP by Stradex
+		}
+
+	} else {
+		args.Set("classname", "player_doommarine");
+	}
+
+/*
+	const idDeclEntityDef *def = FindEntityDef( classname, false );
+
+	if ( !def ) {
+		Warning( "Unknown classname '%s'%s.", classname, error.c_str() );
+		return false;
+	}
+*/
+
+	if ( !SpawnEntityDef( args, &ent ) || !entities[ clientNum ] || !coopentities[ clientNum ] ) {
 		Error( "Failed to spawn player as '%s'", args.GetString( "classname" ) );
 	}
 
@@ -1988,6 +2304,61 @@ idPlayer *idGameLocal::GetLocalPlayer() const {
 
 /*
 ================
+idGameLocal::GetCoopPlayer
+
+Nothing in the game tic should EVER make a decision based on what the
+local client number is, it shouldn't even be aware that there is a
+draw phase even happening.  This just returns client 0, which will
+be correct for single player.
+================
+*/
+idPlayer *idGameLocal::GetCoopPlayer() const {
+
+	if (mpGame.IsGametypeCoopBased() && isServer) {
+		if ( localClientNum < 0 || !entities[ localClientNum ] || !entities[ localClientNum ]->IsType( idPlayer::Type )) {
+
+			idPlayer* p = NULL;
+
+			for (int i=0; i < gameLocal.numClients; i++) {
+				if (entities[i] && entities[i]->IsType(idPlayer::Type)) {
+					p = static_cast<idPlayer *>( entities[i] );
+					if (!p->spectating) {
+						return p;
+					}
+				}
+			}
+			return p; //if we reach this point, then we are sending the data of a spectator player
+		}
+	} else {
+		return GetLocalPlayer();
+	}
+
+	return static_cast<idPlayer *>( entities[ localClientNum ] );
+}
+
+/*
+================
+idGameLocal::GetCoopPlayerScriptHack
+================
+*/
+idEntity *idGameLocal::GetCoopPlayerScriptHack() const {
+
+	idEntity* p=NULL;
+	for (int i=0; i < MAX_CLIENTS; i++) {
+		if (entities[i] && entities[i]->IsType(idPlayer::Type)) {
+			p = entities[i];
+			if (!static_cast<idPlayer *>( entities[i] )->spectating) {
+				return p;
+			}
+		}
+	}
+
+	return p;
+}
+
+
+/*
+================
 idGameLocal::SetupClientPVS
 ================
 */
@@ -2014,6 +2385,9 @@ void idGameLocal::SetupPlayerPVS( void ) {
 
 	playerPVS.i = -1;
 	for ( i = 0; i < numClients; i++ ) {
+		if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && i != localClientNum) {
+			continue;
+		}
 		ent = entities[i];
 		if ( !ent || !ent->IsType( idPlayer::Type ) ) {
 			continue;
@@ -2085,6 +2459,44 @@ bool idGameLocal::InPlayerConnectedArea( idEntity *ent ) const {
 		return false;
 	}
 	return pvs.InCurrentPVS( playerConnectedAreas, ent->GetPVSAreas(), ent->GetNumPVSAreas() );
+}
+
+/*
+================
+idGameLocal::InCoopPlayersPVS
+
+  should only be called during entity thinking and event handling
+  COOP Only
+================
+*/
+bool idGameLocal::InCoopPlayersPVS( idEntity *ent ) const { //Experimental, maybe can be a bit CPU performance killer with many players
+	if (isClient) {
+		common->Warning("[COOP] Client tried to use idGameLocal::InCoopPlayersPVS...\n");
+		return false; //clients should never reach this point
+	}
+
+	//based in idGameLocal::ServerWriteSnapshot code
+	pvsHandle_t pvsHandle;
+	int numSourceAreas, sourceAreas[ idEntity::MAX_PVS_AREAS ];
+
+	for (int i=0; i < gameLocal.numClients; i++) {
+		idPlayer *player;
+		player = static_cast<idPlayer *>( entities[ i ] );
+		if (!player || player->spectating) {
+			continue; //ignore this player
+		}
+
+		numSourceAreas = gameRenderWorld->BoundsInAreas( player->GetPlayerPhysics()->GetAbsBounds(), sourceAreas, idEntity::MAX_PVS_AREAS );
+		pvsHandle = gameLocal.pvs.SetupCurrentPVS( sourceAreas, numSourceAreas, PVS_NORMAL );
+
+		if (ent->PhysicsTeamInPVS( pvsHandle )) {
+			pvs.FreeCurrentPVS( pvsHandle );
+			return true; //entity is present in atleast one player PVS
+		}
+		pvs.FreeCurrentPVS( pvsHandle );
+	}
+
+	return false;
 }
 
 /*
@@ -2226,9 +2638,10 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
 		// update the game time
 		framenum++;
 		previousTime = time;
+		previousClientsideTime = time;
 		time += msec;
 		realClientTime = time;
-
+		clientsideTime = time;
 #ifdef GAME_DLL
 		// allow changing SIMD usage on the fly
 		if ( com_forceGenericSIMD.IsModified() ) {
@@ -2250,7 +2663,7 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
 
 		// clear any debug lines from a previous frame
 		gameRenderWorld->DebugClearLines( time );
-
+		
 		// clear any debug polygons from a previous frame
 		gameRenderWorld->DebugClearPolygons( time );
 
@@ -2301,14 +2714,18 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
 						ent->GetPhysics()->UpdateTime( time );
 						continue;
 					}
-					ent->Think();
-					num++;
+					if (!gameLocal.mpGame.IsGametypeCoopBased() || !isRestartingMap || ent->IsType(idPlayer::Type)) { //avoid thinking while localMapRestart in coop
+						ent->Think();
+						num++;
+					}
 				}
 			} else {
 				num = 0;
 				for( ent = activeEntities.Next(); ent != NULL; ent = ent->activeNode.Next() ) {
-					ent->Think();
-					num++;
+					if (!gameLocal.mpGame.IsGametypeCoopBased() || !isRestartingMap  || ent->IsType(idPlayer::Type)) { //avoid thinking while localMapRestart in coop
+						ent->Think();
+						num++;
+					}
 				}
 			}
 		}
@@ -2391,6 +2808,12 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds ) {
 		skipCinematic = false;
 	}
 
+	//COOP DEBUG
+	if (mpGame.IsGametypeCoopBased()) {
+		sendServerOverflowEvents();
+	}
+		//END COOP DEBUG
+
 	// show any debug info for this frame
 	RunDebugInfo();
 	D_DrawDebugLines();
@@ -2424,6 +2847,13 @@ void idGameLocal::CalcFov( float base_fov, float &fov_x, float &fov_y ) const {
 	x = 640.0f / tan( base_fov / 360.0f * idMath::PI );
 	y = atan2( 480.0f, x );
 	fov_y = y * 360.0f / idMath::PI;
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient && fov_y  <= 0) {
+		gameLocal.DebugPrintf("Invalid fov_y at idGameLocal::CalcFov, using player fov\n");
+		fov_x = base_fov;
+		fov_y = base_fov;
+		return;
+	}
 
 	// FIXME: somehow, this is happening occasionally
 	assert( fov_y > 0 );
@@ -2511,6 +2941,11 @@ idGameLocal::HandleESC
 */
 escReply_t idGameLocal::HandleESC( idUserInterface **gui ) {
 	if ( isMultiplayer ) {
+		idPlayer *player = GetLocalPlayer();
+		if (gameLocal.mpGame.IsGametypeCoopBased() && player && player->objectiveSystem && player->objectiveSystemOpen) {
+			player->PerformImpulse(IMPULSE_21);
+			return ESC_IGNORE;
+		}
 		*gui = StartMenu();
 		// we may set the gui back to NULL to hide it
 		return ESC_GUI;
@@ -2698,11 +3133,55 @@ void idGameLocal::RunDebugInfo( void ) {
 
 	const idVec3 &origin = player->GetPhysics()->GetOrigin();
 
+	idMat3		axis = player->viewAngles.ToMat3(); //coop debug
+	idVec3		up = axis[ 2 ] * 5.0f;  //coop debug
+	idBounds	viewTextBounds( origin );  //coop debug
+	idBounds	viewBounds( origin );  //coop debug
+
+	if (net_clientCoopDebug.GetBool()) { //debug only, remove later
+		//Show snapshot entities only
+		viewTextBounds.ExpandSelf( 128.0f );
+		viewBounds.ExpandSelf( 512.0f );
+		for( ent = snapshotEntities.Next(); ent != NULL; ent = ent->snapshotNode.Next() ) {
+			// don't draw the worldspawn
+			if ( ent == world ) {
+				continue;
+			}
+
+			// skip if the entity is very far away
+			if ( !viewBounds.IntersectsBounds( ent->GetPhysics()->GetAbsBounds() ) ) {
+				continue;
+			}
+
+			const idBounds &entBounds = ent->GetPhysics()->GetAbsBounds();
+			int contents = ent->GetPhysics()->GetContents();
+			if ( contents & CONTENTS_BODY ) {
+				gameRenderWorld->DebugBounds( colorCyan, entBounds );
+			} else if ( contents & CONTENTS_TRIGGER ) {
+				gameRenderWorld->DebugBounds( colorOrange, entBounds );
+			} else if ( contents & CONTENTS_SOLID ) {
+				gameRenderWorld->DebugBounds( colorGreen, entBounds );
+			} else {
+				if ( !entBounds.GetVolume() ) {
+					gameRenderWorld->DebugBounds( colorMdGrey, entBounds.Expand( 8.0f ) );
+				} else {
+					gameRenderWorld->DebugBounds( colorMdGrey, entBounds );
+				}
+			}
+			if ( viewTextBounds.IntersectsBounds( entBounds ) ) {
+				gameRenderWorld->DrawText( ent->name.c_str(), entBounds.GetCenter(), 0.1f, colorWhite, axis, 1 );
+				gameRenderWorld->DrawText( va( "#%d", ent->entityNumber ), entBounds.GetCenter() + up, 0.1f, colorWhite, axis, 1 );
+			}
+		}
+	}
+
 	if ( g_showEntityInfo.GetBool() ) {
+		/*s
 		idMat3		axis = player->viewAngles.ToMat3();
 		idVec3		up = axis[ 2 ] * 5.0f;
 		idBounds	viewTextBounds( origin );
 		idBounds	viewBounds( origin );
+		*/
 
 		viewTextBounds.ExpandSelf( 128.0f );
 		viewBounds.ExpandSelf( 512.0f );
@@ -2956,6 +3435,104 @@ bool idGameLocal::CheatsOk( bool requirePlayer ) {
 
 /*
 ===================
+idGameLocal::RegisterRemoveSyncEntity
+===================
+*/
+
+void idGameLocal::RegisterRemoveSyncEntity(idEntity* ent) {
+	removeSyncEntities[num_removeSyncEntities] = ent;
+	ent->entityRemoveSyncNumber = num_removeSyncEntities;
+	num_removeSyncEntities++;
+}
+
+/*
+===================
+idGameLocal::UnregisterRemoveSyncEntity
+===================
+*/
+
+void idGameLocal::UnregisterRemoveSyncEntity(idEntity* ent) {
+	if (ent->entityRemoveSyncNumber == ENTITYNUM_NONE) {
+		return;
+	}
+	removeSyncEntities[ent->entityRemoveSyncNumber] = NULL;
+}
+
+/*
+===================
+idGameLocal::CountMapSyncEntitiesRemoved
+===================
+*/
+
+int idGameLocal::CountMapSyncEntitiesRemoved() const {
+	int count = 0;
+	for (int i = 0; i < num_removeSyncEntities; i++) {
+		if (!removeSyncEntities[i]) {
+			count++;
+		}
+	}
+	return count;
+}
+
+/*
+===================
+idGameLocal::RegisterTargetEntity
+===================
+*/
+void idGameLocal::RegisterTargetEntity( idEntity *ent ) {
+	int target_entnum;
+
+	while( targetentities[firstFreeTargetIndex] && firstFreeTargetIndex < ENTITYNUM_MAX_NORMAL ) {
+		firstFreeTargetIndex++;
+	}
+
+	if ( firstFreeTargetIndex >= ENTITYNUM_MAX_NORMAL ) {
+		Error( "no free target entities" );
+	}
+
+	//DebugPrintf("Adding %s to the targetentities array...\n", ent->GetName());
+
+	target_entnum = firstFreeTargetIndex++;
+
+	targetentities[target_entnum] = ent; //added for coop
+	ent->entityTargetNumber = target_entnum;
+}
+
+/*
+===================
+idGameLocal::RegisterCoopEntity
+===================
+*/
+void idGameLocal::RegisterCoopEntity( idEntity *ent ) {
+	int coop_entnum;
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && !spawnArgs.GetBool("mapEntity", "0") && firstFreeCoopIndex < mapCoopCount) { //Stradex: Ensure that map entities numbers are never used again to force sync between client and server.
+		firstFreeCoopIndex = mapCoopCount;
+	}
+
+	if ( !spawnArgs.GetInt( "coop_entnum", "0", coop_entnum ) ) {
+		while( coopentities[firstFreeCoopIndex] && firstFreeCoopIndex < ENTITYNUM_MAX_NORMAL ) {
+			firstFreeCoopIndex++;
+		}
+		if ( firstFreeCoopIndex >= ENTITYNUM_MAX_NORMAL ) {
+			Error( "no free coop entities" );
+		}
+		coop_entnum = firstFreeCoopIndex++;
+	}
+
+	coopentities[coop_entnum] = ent; //added for coop
+	coopIds[coop_entnum] = coopCount++;
+	ent->entityCoopNumber = coop_entnum;
+	ent->coopNode.AddToEnd(coopSyncEntities); //added for coop
+
+	if ( coop_entnum >= num_coopentities ) {
+		num_coopentities++;
+	}
+
+}
+
+/*
+===================
 idGameLocal::RegisterEntity
 ===================
 */
@@ -2966,21 +3543,48 @@ void idGameLocal::RegisterEntity( idEntity *ent ) {
 		Error( "idGameLocal::RegisterEntity: spawn count overflow" );
 	}
 
+	if (gameLocal.mpGame.IsGametypeCoopBased() && !spawnArgs.GetBool("mapEntity", "0") && firstFreeIndex < mapSpawnCount) { //Stradex: Ensure that map entities numbers are never used again to force sync between client and server.
+		firstFreeIndex = mapSpawnCount;
+	}
+
 	if ( !spawnArgs.GetInt( "spawn_entnum", "0", spawn_entnum ) ) {
-		while( entities[firstFreeIndex] && firstFreeIndex < ENTITYNUM_MAX_NORMAL ) {
-			firstFreeIndex++;
+
+		if (spawnArgs.GetBool("clientside", "0")) { //is  clientside only entity
+			while( entities[firstFreeCsIndex] && firstFreeCsIndex < ENTITYNUM_MAX_NORMAL ) {
+				firstFreeCsIndex++;
+			}
+			if ( firstFreeCsIndex >= ENTITYNUM_MAX_NORMAL ) {
+				Error( "no free clientside entities." );
+			}
+
+			spawn_entnum = firstFreeCsIndex++;
+		} else { //normal entity
+
+			while( entities[firstFreeIndex] && firstFreeIndex < ENTITYNUM_MAX_NORMAL ) {
+				firstFreeIndex++;
+			}
+			if ( firstFreeIndex >= ENTITYNUM_MAX_NORMAL ) {
+				Error( "no free entities" );
+			}
+
+			spawn_entnum = firstFreeIndex++;
 		}
-		if ( firstFreeIndex >= ENTITYNUM_MAX_NORMAL ) {
-			Error( "no free entities" );
-		}
-		spawn_entnum = firstFreeIndex++;
+	}
+
+	if (ent->fl.coopNetworkSync || spawnArgs.GetInt( "coop_entnum", "0")) {
+		RegisterCoopEntity(ent); //for coop only
 	}
 
 	entities[ spawn_entnum ] = ent;
 	spawnIds[ spawn_entnum ] = spawnCount++;
 	ent->entityNumber = spawn_entnum;
 	ent->spawnNode.AddToEnd( spawnedEntities );
-	ent->spawnArgs.TransferKeyValues( spawnArgs );
+
+	if (spawnArgs.GetBool("clientside", "0")) { //added by Stradex
+		ent->clientsideNode.AddToEnd( clientsideEntities ); 
+	}
+
+	ent->spawnArgs.TransferKeyValues( spawnArgs ); //stradex: I love IDSoftware cause this
 
 	if ( spawn_entnum >= num_entities ) {
 		num_entities++;
@@ -2998,7 +3602,7 @@ void idGameLocal::UnregisterEntity( idEntity *ent ) {
 	if ( editEntities ) {
 		editEntities->RemoveSelectedEntity( ent );
 	}
-
+	
 	if ( ( ent->entityNumber != ENTITYNUM_NONE ) && ( entities[ ent->entityNumber ] == ent ) ) {
 		ent->spawnNode.Remove();
 		entities[ ent->entityNumber ] = NULL;
@@ -3006,7 +3610,58 @@ void idGameLocal::UnregisterEntity( idEntity *ent ) {
 		if ( ent->entityNumber >= MAX_CLIENTS && ent->entityNumber < firstFreeIndex ) {
 			firstFreeIndex = ent->entityNumber;
 		}
+
+		UnregisterClientsideEntity(ent);
+		UnregisterTargetEntity(ent);
+		UnregisterCoopEntity(ent);
+
 		ent->entityNumber = ENTITYNUM_NONE;
+
+	}
+}
+
+/*
+===================
+idGameLocal::UnregisterClientsideEntity
+===================
+*/
+void idGameLocal::UnregisterClientsideEntity(idEntity* ent) {
+	ent->clientsideNode.Remove(); //added by Stradex
+	if (ent->entityNumber >= CS_ENTITIES_START && ent->entityNumber < firstFreeCsIndex) { //clientside firstFreeCsIndex update
+		firstFreeCsIndex = ent->entityNumber;
+	}
+}
+
+/*
+===================
+idGameLocal::UnregisterEntity
+===================
+*/
+void idGameLocal::UnregisterCoopEntity(idEntity* ent) {
+	if (ent->coopNode.InList()) { //probably a coop entity then
+		//added by Stradex for coop
+		ent->coopNode.Remove();
+		coopentities[ent->entityCoopNumber] = NULL;
+		coopIds[ent->entityCoopNumber] = -1;
+		if (ent->entityCoopNumber >= MAX_CLIENTS && ent->entityCoopNumber < firstFreeCoopIndex) {
+			firstFreeCoopIndex = ent->entityCoopNumber;
+		}
+		ent->entityCoopNumber = ENTITYNUM_NONE;
+	}
+}
+
+/*
+===================
+idGameLocal::UnregisterTargetEntity
+===================
+*/
+void idGameLocal::UnregisterTargetEntity(idEntity* ent) {
+	if (( ent->entityTargetNumber != ENTITYNUM_NONE ) && ( targetentities[ent->entityTargetNumber] == ent )) {
+		if (ent->entityTargetNumber >= MAX_CLIENTS && ent->entityTargetNumber < firstFreeTargetIndex) {
+			firstFreeTargetIndex = ent->entityTargetNumber;
+		}
+		targetentities[ent->entityTargetNumber] = NULL;
+		ent->entityTargetNumber = ENTITYNUM_NONE;
 	}
 }
 
@@ -3054,13 +3709,18 @@ Finds the spawn function for the entity and calls it,
 returning false if not found
 ===================
 */
-bool idGameLocal::SpawnEntityDef( const idDict &args, idEntity **ent, bool setDefaults ) {
+bool idGameLocal::SpawnEntityDef( const idDict &args, idEntity **ent, bool setDefaults, bool bIsClientReadSnapshot  ) {
 	const char	*classname;
 	const char	*spawn;
 	idTypeInfo	*cls;
 	idClass		*obj;
 	idStr		error;
 	const char  *name;
+
+	/*
+	if (!bIsClientReadSnapshot && gameLocal.isClient) {
+		common->Warning("[COOP] entity %s spawned outside of clientReadSnapshot!!\n", args.GetString("name", "unkwown")); //added for coop debug
+	}*/
 
 	if ( ent ) {
 		*ent = NULL;
@@ -3133,7 +3793,13 @@ idGameLocal::FindEntityDef
 const idDeclEntityDef *idGameLocal::FindEntityDef( const char *name, bool makeDefault ) const {
 	const idDecl *decl = NULL;
 	if ( isMultiplayer ) {
-		decl = declManager->FindType( DECL_ENTITYDEF, va( "%s_mp", name ), false );
+		//stradex start
+		if (mpGame.IsGametypeCoopBased()) { //specific coop stuff
+			decl = declManager->FindType( DECL_ENTITYDEF, va( "%s_coop", name ), false ); //cause maybe some modders want specific coop entityDefs...
+		} else {
+		//stradex end
+			decl = declManager->FindType( DECL_ENTITYDEF, va( "%s_mp", name ), false );
+		}
 	}
 	if ( !decl ) {
 		decl = declManager->FindType( DECL_ENTITYDEF, name, makeDefault );
@@ -3160,25 +3826,27 @@ bool idGameLocal::InhibitEntitySpawn( idDict &spawnArgs ) {
 
 	bool result = false;
 
-	if ( isMultiplayer ) {
+	int gSkill = (isMultiplayer && gameLocal.mpGame.IsGametypeCoopBased()) ? gameLocal.serverInfo.GetInt("g_skill")  : g_skill.GetInteger();
+
+	if ( isMultiplayer && !gameLocal.mpGame.IsGametypeCoopBased() ) {
 		spawnArgs.GetBool( "not_multiplayer", "0", result );
-	} else if ( g_skill.GetInteger() == 0 ) {
+	} else if ( gSkill == 0 ) {
 		spawnArgs.GetBool( "not_easy", "0", result );
-	} else if ( g_skill.GetInteger() == 1 ) {
+	} else if ( gSkill == 1 ) {
 		spawnArgs.GetBool( "not_medium", "0", result );
 	} else {
 		spawnArgs.GetBool( "not_hard", "0", result );
 	}
 
 	const char *name;
-	if ( g_skill.GetInteger() == 3 ) {
+	if ( gSkill == 3 ) {
 		name = spawnArgs.GetString( "classname" );
 		if ( idStr::Icmp( name, "item_medkit" ) == 0 || idStr::Icmp( name, "item_medkit_small" ) == 0 ) {
 			result = true;
 		}
 	}
 
-	if ( gameLocal.isMultiplayer ) {
+	if ( gameLocal.isMultiplayer && !gameLocal.mpGame.IsGametypeCoopBased() ) {
 		name = spawnArgs.GetString( "classname" );
 		if ( idStr::Icmp( name, "weapon_bfg" ) == 0 || idStr::Icmp( name, "weapon_soulcube" ) == 0 ) {
 			result = true;
@@ -3240,7 +3908,9 @@ void idGameLocal::SpawnMapEntities( void ) {
 		return;
 	}
 
-	SetSkill( g_skill.GetInteger() );
+	int gSkill = (isMultiplayer && gameLocal.mpGame.IsGametypeCoopBased()) ? gameLocal.serverInfo.GetInt("g_skill")  : g_skill.GetInteger();
+
+	SetSkill( gSkill ); //Should we modify this?
 
 	numEntities = mapFile->GetNumEntities();
 	if ( numEntities == 0 ) {
@@ -3262,7 +3932,9 @@ void idGameLocal::SpawnMapEntities( void ) {
 	for ( i = 1 ; i < numEntities ; i++ ) {
 		mapEnt = mapFile->GetEntity( i );
 		args = mapEnt->epairs;
-
+		if (gameLocal.mpGame.IsGametypeCoopBased()) {
+			args.Set("mapEntity", "1");
+		}
 		if ( !InhibitEntitySpawn( args ) ) {
 			// precache any media specified in the map entity
 			CacheDictionaryMedia( &args );
@@ -3283,8 +3955,19 @@ idGameLocal::AddEntityToHash
 ================
 */
 void idGameLocal::AddEntityToHash( const char *name, idEntity *ent ) {
-	if ( FindEntity( name ) ) {
-		Error( "Multiple entities named '%s'", name );
+	idEntity* tmpEnt;
+	tmpEnt = FindEntity( name );
+	if ( tmpEnt ) {
+		if (isClient && mpGame.IsGametypeCoopBased() && !tmpEnt->fl.coopNetworkSync) {
+			//nonsync coop enities can avoid this crash but it's kinda dangereous (could lead to deleting a NULL pointer later... or even worse).
+#ifdef _DEBUG
+			common->Warning( "[COOP FATAL] Multiple entities named '%s', deleting the old one...\n", name );
+#endif
+			delete tmpEnt;
+		} else {
+			Error( "Multiple entities named '%s'", name );
+		}
+	
 	}
 	entityHash.Add( entityHash.GenerateKey( name, true ), ent->entityNumber );
 }
@@ -3306,6 +3989,24 @@ bool idGameLocal::RemoveEntityFromHash( const char *name, idEntity *ent ) {
 	}
 	return false;
 }
+
+/*
+================
+idGameLocalEntityFromHashExists
+================
+*/
+bool idGameLocal::EntityFromHashExists( const char *name )  {
+	int hash, i;
+
+	hash = entityHash.GenerateKey( name, true );
+	for ( i = entityHash.First( hash ); i != -1; i = entityHash.Next( i ) ) {
+		if (entities[i] && entities[i]->name.Icmp( name ) == 0 ) {
+			return true;
+		}
+	}
+	return false;
+}
+
 
 /*
 ================
@@ -3515,6 +4216,10 @@ void idGameLocal::KillBox( idEntity *ent, bool catch_teleport ) {
 			continue;
 		}
 
+		if (hit->IsType( idPlayer::Type ) && ent->IsType( idPlayer::Type ) && mpGame.IsGametypeCoopBased()) {
+			continue; //no telefrag in coop
+		}
+
 		// nail it
 		if ( hit->IsType( idPlayer::Type ) && static_cast< idPlayer * >( hit )->IsInTeleport() ) {
 			static_cast< idPlayer * >( hit )->TeleportDeath( ent->entityNumber );
@@ -3535,22 +4240,28 @@ idGameLocal::RequirementMet
 ================
 */
 bool idGameLocal::RequirementMet( idEntity *activator, const idStr &requires, int removeItem ) {
-	if ( requires.Length() ) {
-		if ( activator->IsType( idPlayer::Type ) ) {
-			idPlayer *player = static_cast<idPlayer *>(activator);
-			idDict *item = player->FindInventoryItem( requires );
-			if ( item ) {
-				if ( removeItem ) {
-					player->RemoveInventoryItem( item );
-				}
-				return true;
-			} else {
-				return false;
-			}
-		}
+	if (!requires.Length()) {
+		return true;
+	}
+	if (!activator) {
+		return false;
 	}
 
-	return true;
+	if (!activator->IsType(idPlayer::Type)) {
+		return true;
+	}
+
+	idPlayer* player = static_cast<idPlayer*>(activator);
+	idDict* item = player->FindInventoryItem(requires);
+	if (item) {
+
+		if (removeItem) {
+			player->RemoveInventoryItem(item);
+		}
+		return true;
+	}
+
+	return false;
 }
 
 /*
@@ -3584,7 +4295,7 @@ idActor *idGameLocal::GetAlertEntity( void ) {
 idGameLocal::RadiusDamage
 ============
 */
-void idGameLocal::RadiusDamage( const idVec3 &origin, idEntity *inflictor, idEntity *attacker, idEntity *ignoreDamage, idEntity *ignorePush, const char *damageDefName, float dmgPower ) {
+void idGameLocal::RadiusDamage( const idVec3 &origin, idEntity *inflictor, idEntity *attacker, idEntity *ignoreDamage, idEntity *ignorePush, const char *damageDefName, float dmgPower, bool clientsideDamage  ) {
 	float		dist, damageScale, attackerDamageScale, attackerPushScale;
 	idEntity *	ent;
 	idEntity *	entityList[ MAX_GENTITIES ];
@@ -3646,6 +4357,10 @@ void idGameLocal::RadiusDamage( const idVec3 &origin, idEntity *inflictor, idEnt
 			continue;
 		}
 
+		if (!ProjectileCanDoRadiusDamage(inflictor, attacker, ent)) {
+			continue;
+		}
+
 		// find the distance from the edge of the bounding box
 		for ( i = 0; i < 3; i++ ) {
 			if ( origin[ i ] < ent->GetPhysics()->GetAbsBounds()[0][ i ] ) {
@@ -3674,15 +4389,53 @@ void idGameLocal::RadiusDamage( const idVec3 &origin, idEntity *inflictor, idEnt
 				damageScale *= attackerDamageScale;
 			}
 
-			ent->Damage( inflictor, attacker, dir, damageDefName, damageScale, INVALID_JOINT );
+			if ( !gameLocal.mpGame.IsGametypeCoopBased() || !g_clientsideDamage.GetBool() || !clientsideDamage
+				|| (gameLocal.isClient && inflictor && inflictor->clientsideNode.InList()) 
+				|| (gameLocal.isServer && ent->entityNumber == this->localClientNum) ) {
+				ent->Damage( inflictor, attacker, dir, damageDefName, damageScale, INVALID_JOINT, clientsideDamage );
+			}
 		}
 	}
 
 	// push physics objects
-	if ( push ) {
+	if ( push && !gameLocal.isClient ) {
 		RadiusPush( origin, radius, push * dmgPower, attacker, ignorePush, attackerPushScale, false );
 	}
 }
+
+/*
+==============
+idGameLocal::ProjectileCanDoClientsideDamage
+==============
+*/
+bool idGameLocal::ProjectileCanDoRadiusDamage(idEntity* inflictor, idEntity* attacker, idEntity* victim) {
+	if (gameLocal.isServer) {
+		return true;
+	}
+
+	if (!g_clientsideDamage.GetBool()) {
+		return false;
+	}
+
+	if (!inflictor || !inflictor->clientsideNode.InList()) {
+		return false;
+	}
+
+	if (victim && victim->entityNumber == this->localClientNum) {
+		return true;
+	}
+
+	if (!attacker || attacker->entityNumber != this->localClientNum) {
+		return false;
+	}
+
+	if (inflictor && inflictor->IsType(idProjectile::Type) && static_cast<idProjectile*>(inflictor)->selfClientside) {
+		return true;
+	}
+
+	return false;
+}
+
 
 /*
 ==============
@@ -3834,6 +4587,11 @@ void idGameLocal::ProjectDecal( const idVec3 &origin, const idVec3 &dir, float d
 		idVec3(  1.0f, -1.0f, 0.0f )
 	};
 
+	if (mpGame.IsGametypeCoopBased() && (FLOAT_IS_NAN(dir.x) || FLOAT_IS_NAN(dir.y) || FLOAT_IS_NAN(dir.z) || FLOAT_IS_NAN(origin.x)  || FLOAT_IS_NAN(origin.y) || FLOAT_IS_NAN(origin.z))) {
+		common->DWarning("[COOP FATAL] FLOAT_IS_NAN at idGameLocal::ProjectDecal\n");
+		return;
+	}
+
 	if ( !g_decals.GetBool() ) {
 		return;
 	}
@@ -3898,11 +4656,19 @@ idGameLocal::SetCamera
 =============
 */
 void idGameLocal::SetCamera( idCamera *cam ) {
+	if (mpGame.IsGametypeCoopBased()) {
+		return SetCameraCoop(cam);
+	}
+
 	int i;
 	idEntity *ent;
 	idAI *ai;
 
 	// this should fix going into a cinematic when dead.. rare but happens
+	if (gameLocal.isClient) { //Clients can't reach this point
+		return;
+	}
+
 	idPlayer *client = GetLocalPlayer();
 	if ( client->health <= 0 || client->AI_DEAD ) {
 		return;
@@ -4144,29 +4910,42 @@ void idGameLocal::RandomizeInitialSpawns( void ) {
 	spawnSpot_t	spot;
 	int i, j;
 	idEntity *ent;
+	char spawnDefEntity[] = "info_player_deathmatch"; //added by Stradex for COOP
 
 	if ( !isMultiplayer || isClient ) {
 		return;
 	}
+
+	
+	if ( mpGame.IsGametypeCoopBased()) {
+		strcpy(spawnDefEntity, "info_player_coop"); //added by Stradex for COOP
+	} else {
+		strcpy(spawnDefEntity, "info_player_deathmatch");
+	}
+
 	spawnSpots.Clear();
 	initialSpots.Clear();
 	spot.dist = 0;
-	spot.ent = FindEntityUsingDef( NULL, "info_player_deathmatch" );
+
+	spot.ent = FindEntityUsingDef( NULL,  static_cast<const char*>(spawnDefEntity) );
+	
 	while( spot.ent ) {
-		spawnSpots.Append( spot );
-		if ( spot.ent->spawnArgs.GetBool( "initial" ) ) {
-			initialSpots.Append( spot.ent );
+		if (!spot.ent->spawnArgs.GetBool( "start_off" )) { //for OpenCoop maps compatibility
+			spawnSpots.Append( spot );
+			if ( spot.ent->spawnArgs.GetBool( "initial" ) ) {
+				initialSpots.Append( spot.ent );
+			}
 		}
-		spot.ent = FindEntityUsingDef( spot.ent, "info_player_deathmatch" );
+		spot.ent = FindEntityUsingDef( spot.ent, static_cast<const char*>(spawnDefEntity) );
 	}
 	if ( !spawnSpots.Num() ) {
-		common->Warning( "no info_player_deathmatch in map" );
+		common->Warning( "no %s in map", static_cast<const char*>(spawnDefEntity) );
 		return;
 	}
 	common->Printf( "%d spawns (%d initials)\n", spawnSpots.Num(), initialSpots.Num() );
 	// if there are no initial spots in the map, consider they can all be used as initial
 	if ( !initialSpots.Num() ) {
-		common->Warning( "no info_player_deathmatch entities marked initial in map" );
+		common->Warning( "no %s entities marked initial in map", static_cast<const char*>(spawnDefEntity) );
 		for ( i = 0; i < spawnSpots.Num(); i++ ) {
 			initialSpots.Append( spawnSpots[ i ].ent );
 		}
@@ -4196,19 +4975,22 @@ idEntity *idGameLocal::SelectInitialSpawnPoint( idPlayer *player ) {
 	idVec3			pos;
 	float			dist;
 	bool			alone;
+	int				spotIndex=-1;
 
 	if ( !isMultiplayer || !spawnSpots.Num() ) {
 		spot.ent = FindEntityUsingDef( NULL, "info_player_start" );
 		if ( !spot.ent ) {
 			Error( "No info_player_start on map.\n" );
 		}
+		spPlayerStartSpot.ent = spot.ent;
 		return spot.ent;
 	}
 	if ( player->spectating ) {
 		// plain random spot, don't bother
-		return spawnSpots[ random.RandomInt( spawnSpots.Num() ) ].ent;
+		spotIndex = random.RandomInt(spawnSpots.Num());
+		spot.ent = spawnSpots[spotIndex].ent;
 	} else if ( player->useInitialSpawns && currentInitialSpot < initialSpots.Num() ) {
-		return initialSpots[ currentInitialSpot++ ];
+		spot.ent = initialSpots[currentInitialSpot++];
 	} else {
 		// check if we are alone in map
 		alone = true;
@@ -4220,35 +5002,69 @@ idEntity *idGameLocal::SelectInitialSpawnPoint( idPlayer *player ) {
 		}
 		if ( alone ) {
 			// don't do distance-based
-			return spawnSpots[ random.RandomInt( spawnSpots.Num() ) ].ent;
-		}
+			spotIndex = random.RandomInt(spawnSpots.Num());
+			spot.ent = spawnSpots[spotIndex].ent;
+		}	else {
 
-		// find the distance to the closest active player for each spawn spot
-		for( i = 0; i < spawnSpots.Num(); i++ ) {
-			pos = spawnSpots[ i ].ent->GetPhysics()->GetOrigin();
-			spawnSpots[ i ].dist = 0x7fffffff;
-			for( j = 0; j < MAX_CLIENTS; j++ ) {
-				if ( !entities[ j ] || !entities[ j ]->IsType( idPlayer::Type )
-					|| entities[ j ] == player
-					|| static_cast< idPlayer * >( entities[ j ] )->spectating ) {
-					continue;
+			// find the distance to the closest active player for each spawn spot
+			for (i = 0; i < spawnSpots.Num(); i++) {
+				if (mpGame.IsGametypeCoopBased() && !SecureCheckIfEntityExists(spawnSpots[i].ent)) { //Monorail bug related to invalid spawnspot while respawning
+					return CheckAndGetValidSpawnSpot(spawnSpots[i].ent, i);
 				}
+				pos = spawnSpots[i].ent->GetPhysics()->GetOrigin();
+				spawnSpots[i].dist = 0x7fffffff;
+				for (j = 0; j < MAX_CLIENTS; j++) {
+					if (!entities[j] || !entities[j]->IsType(idPlayer::Type)
+						|| entities[j] == player
+						|| static_cast<idPlayer*>(entities[j])->spectating) {
+						continue;
+					}
 
-				dist = ( pos - entities[ j ]->GetPhysics()->GetOrigin() ).LengthSqr();
-				if ( dist < spawnSpots[ i ].dist ) {
-					spawnSpots[ i ].dist = dist;
+					dist = (pos - entities[j]->GetPhysics()->GetOrigin()).LengthSqr();
+					if (dist < spawnSpots[i].dist) {
+						spawnSpots[i].dist = dist;
+					}
 				}
 			}
+
+			// sort the list
+			qsort((void*)spawnSpots.Ptr(), spawnSpots.Num(), sizeof(spawnSpot_t), (int (*)(const void*, const void*))sortSpawnPoints);
+
+			// choose a random one in the top half
+			which = random.RandomInt(spawnSpots.Num() / 2);
+			spotIndex = which;
+			spot = spawnSpots[spotIndex];
 		}
-
-		// sort the list
-		qsort( ( void * )spawnSpots.Ptr(), spawnSpots.Num(), sizeof( spawnSpot_t ), ( int (*)(const void *, const void *) )sortSpawnPoints );
-
-		// choose a random one in the top half
-		which = random.RandomInt( spawnSpots.Num() / 2 );
-		spot = spawnSpots[ which ];
 	}
+
+
+	if (mpGame.IsGametypeCoopBased()) {
+		spot.ent = CheckAndGetValidSpawnSpot(spot.ent, spotIndex);
+	}
+
 	return spot.ent;
+}
+
+/*
+================
+idGameLocal::CheckAndGetValidSpawnSpot
+================
+*/
+
+idEntity* idGameLocal::CheckAndGetValidSpawnSpot(idEntity* spotEnt, int spotEntIndex) {
+	idEntity* validSpotEnt = spotEnt;
+	if (!SecureCheckIfEntityExists(validSpotEnt) || (validSpotEnt->entityNumber < MAX_CLIENTS)) { //Monorail bug related to invalid player spawnspot while respawning
+		common->Warning("[COOP FATAL] NULL spot.ent at idGameLocal::SelectInitialSpawnPoint, using info_player_start and removing invalid spawnSpot.\n");
+		if (spotEntIndex != -1) {
+			spawnSpots.RemoveIndex(spotEntIndex);
+		}
+		validSpotEnt = FindEntityUsingDef(NULL, "info_player_start");
+		if (!validSpotEnt) {
+			Error("No info_player_start on map, Impossible to get valid spawnSpot.\n");
+		}
+	}
+
+	return validSpotEnt;
 }
 
 /*
@@ -4266,6 +5082,10 @@ void idGameLocal::UpdateServerInfoFlags() {
 		gameType = GAME_TDM;
 	} else if ( ( idStr::Icmp( serverInfo.GetString( "si_gameType" ), "Last Man" ) == 0 ) ) {
 		gameType = GAME_LASTMAN;
+	} else if ( ( idStr::Icmp( serverInfo.GetString( "si_gameType" ), "Coop" ) == 0 ) ) { //added by Stradex for COOP
+		gameType = GAME_COOP;
+	} else if ( ( idStr::Icmp( serverInfo.GetString( "si_gameType" ), "Survival" ) == 0 ) ) { //added by Stradex for SURVIVAL COOP
+		gameType = GAME_SURVIVAL;
 	}
 	if ( gameType == GAME_LASTMAN ) {
 		if ( !serverInfo.GetInt( "si_warmup" ) ) {
@@ -4306,6 +5126,16 @@ idGameLocal::GetSpawnId
 int idGameLocal::GetSpawnId( const idEntity* ent ) const {
 	return ( gameLocal.spawnIds[ ent->entityNumber ] << GENTITYNUM_BITS ) | ent->entityNumber;
 }
+
+/*
+================
+idGameLocal::GetCoopId
+================
+*/
+int idGameLocal::GetCoopId( const idEntity* ent ) const {
+	return ( gameLocal.coopIds[ ent->entityCoopNumber ] << GENTITYNUM_BITS ) | ent->entityCoopNumber;
+}
+
 
 /*
 ================
@@ -4409,3 +5239,158 @@ idGameLocal::GetMapLoadingGUI
 ===============
 */
 void idGameLocal::GetMapLoadingGUI( char gui[ MAX_STRING_CHARS ] ) { }
+
+/*
+===============
+idGameLocal::isNPC (DIRTY HACK for LibreCoop NPC functionality without touching pk4 data
+===============
+*/
+bool idGameLocal::isNPC(idEntity *ent ) const {
+	if (!ent)
+		return false;
+	const idKeyValue	*talksKey;
+	bool entityTalks = false;
+
+	if (ent->IsType(idAI::Type)) {
+		talksKey = ent->spawnArgs.FindKey( "talks" );
+		if (talksKey) {
+			entityTalks = ( atoi( talksKey->GetValue() ) != 0 );
+		}
+	} else if (ent->IsType(idAFAttachment::Type) && static_cast<idAFAttachment*>(ent)->GetBody() && static_cast<idAFAttachment*>(ent)->GetBody() != ent) {
+		idEntity* bodyEnt = static_cast<idAFAttachment*>(ent)->GetBody();
+		return isNPC(bodyEnt);
+	}
+	if (!entityTalks) //last resource: check scriptobject
+	{
+		const char *scriptObjectName;
+		if ( spawnArgs.GetString( "scriptobject", NULL, &scriptObjectName ) && scriptObjectName && !idStr::Icmp( scriptObjectName, "character") ) {
+			entityTalks = true;
+		}
+	}
+
+	return entityTalks;
+}
+
+/*
+=============
+idGameLocal::SetClientCamera
+=============
+*/
+void idGameLocal::SetClientCamera(idCamera* cam) {
+	assert(gameLocal.isClient);
+
+	int i;
+	idEntity* ent;
+	idAI* ai;
+	idPlayer* client = GetLocalPlayer();
+
+	camera = cam;
+	if (camera) {
+		inCinematic = true;
+		if (time > cinematicStopTime) {
+			cinematicSkipTime = time + CINEMATIC_SKIP_DELAY;
+		}
+		for (i = 0; i < numClients; i++) {
+			if (entities[i]) {
+				client = static_cast<idPlayer*>(entities[i]);
+				client->EnterCinematic();
+			}
+		}
+	} else {
+		inCinematic = false;
+		cinematicStopTime = time + msec;
+		// show all the player models
+		for (i = 0; i < numClients; i++) {
+			if (entities[i]) {
+				idPlayer* client = static_cast<idPlayer*>(entities[i]);
+				client->ExitCinematic();
+			}
+		}
+	}
+}
+
+/*
+=============
+idGameLocal::SetCameraCoop
+=============
+*/
+void idGameLocal::SetCameraCoop( idCamera *cam ) {
+
+	if (gameLocal.isClient) {
+		return;
+	}
+
+	int i;
+	idEntity *ent;
+	idAI *ai;
+
+	// this should fix going into a cinematic when dead.. rare but happens
+	idPlayer *client = GetLocalPlayer();
+
+	camera = cam;
+	if ( camera ) {
+		inCinematic = true;
+
+		if ( time > cinematicStopTime ) {
+			cinematicSkipTime = time + CINEMATIC_SKIP_DELAY;
+		}
+
+		// hide all the player models
+		for( i = 0; i < numClients; i++ ) {
+			if ( entities[ i ] ) {
+				client = static_cast< idPlayer* >( entities[ i ] );
+				client->EnterCinematic();
+			}
+		}
+
+		if ( !cam->spawnArgs.GetBool( "ignore_enemies" ) && gameLocal.isServer) {
+			// kill any active monsters that are enemies of the player
+			for ( ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
+				if ( ent->cinematic || ent->fl.isDormant ) {
+					// only kill entities that aren't needed for cinematics and aren't dormant
+					continue;
+				}
+
+				if ( ent->IsType( idAI::Type ) ) {
+					ai = static_cast<idAI *>( ent );
+					if ( !ai->GetEnemy() || !ai->IsActive() ) {
+						// no enemy, or inactive, so probably safe to ignore
+						continue;
+					}
+				} else if ( ent->IsType( idProjectile::Type ) ) {
+					// remove all projectiles
+				} else if ( ent->spawnArgs.GetBool( "cinematic_remove" ) ) {
+					// remove anything marked to be removed during cinematics
+				} else {
+					// ignore everything else
+					continue;
+				}
+
+				// remove it
+				DPrintf( "removing '%s' for cinematic\n", ent->GetName() );
+				ent->PostEventMS( &EV_Remove, 0 );
+			}
+		}
+	} else {
+		inCinematic = false;
+		cinematicStopTime = time + msec;
+
+		// show all the player models
+		for( i = 0; i < numClients; i++ ) {
+			if ( entities[ i ] ) {
+				idPlayer *client = static_cast< idPlayer* >( entities[ i ] );
+				client->ExitCinematic();
+			}
+		}
+	}
+}
+
+/*
+=============
+idGameLocal::SecureCheckIfEntityIsValid
+=============
+*/
+
+bool idGameLocal::SecureCheckIfEntityExists(idEntity* ent) {
+	return ent && (ent->entityNumber >= 0 && ent->entityNumber < ENTITYNUM_NONE);
+}

@@ -42,6 +42,7 @@ class idRenderModelManager;
 class idUserInterface;
 class idUserInterfaceManager;
 class idNetworkSystem;
+class idPlayer; //added for Coop (if crash or something, then we're moving to game_local)
 
 /*
 ===============================================================================

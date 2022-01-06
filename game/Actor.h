@@ -123,6 +123,14 @@ public:
 							idActor( void );
 	virtual					~idActor( void );
 
+	enum {
+		ACTOR_ANIM_CYCLE,
+		ACTOR_ANIM_PLAY,
+		ACTOR_ANIM_IDLE,
+		ACTOR_ANIM_STOP
+	};
+
+
 	void					Spawn( void );
 	virtual void			Restart( void );
 
@@ -165,7 +173,8 @@ public:
 
 							// damage
 	void					SetupDamageGroups( void );
-	virtual	void			Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, const char *damageDefName, const float damageScale, const int location );
+	virtual	void			Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, const char *damageDefName, const float damageScale, const int location, const bool canBeClientDamage = false );
+	virtual	void			ClientReceivedDamage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, int damage, const int location ); //coop added
 	int						GetDamageForLocation( int damage, int location );
 	const char *			GetDamageGroup( int location );
 	void					ClearPain( void );
@@ -209,6 +218,23 @@ public:
 	bool					AnimDone( int channel, int blendFrames ) const;
 	virtual void			SpawnGibs( const idVec3 &dir, const char *damageDefName );
 
+	void					Event_OverrideAnim( int channel ); //Public for coop. Was private
+	virtual bool			ServerReceiveEvent( int event, int time, const idBitMsg &msg ); //added for coop
+
+	//Coop only dirty hack for smooth sync
+	int						currentTorsoAnim;
+	int						currentLegsAnim;
+	int						currentHeadAnim;
+	int						currentAnimType;
+	int						snapshotTorsoAnim;
+	int						snapshotLegsAnim;
+	int						snapshotHeadAnim;
+	int						snapshotAnimType;
+
+	void					PlayAnimID(int channel, int anim);
+	void					PlayCycleID(int channel, int anim);
+	void					PlayIdleID(int channel, int anim);
+
 protected:
 	friend class			idAnimState;
 
@@ -228,6 +254,12 @@ protected:
 	bool						use_combat_bbox;	// whether to use the bounding box for combat collision
 	idEntityPtr<idAFAttachment>	head;
 	idList<copyJoints_t>		copyJoints;			// copied from the body animation to the head model
+
+	int						nextTimeHealthReaded; //for g_clientsideDamage 1
+	int						clientsideDamageInflicted; // for g_clientsideDamage 1
+	int						clientsideDamageLocation; // for g_clientsideDamage 1
+	idVec3					clientsideDamageDir;  // for g_clientsideDamage 1
+	idEntity*				lastPlayerDamage; // for g_clientsideDamage 1
 
 	// state variables
 	const function_t		*state;
@@ -296,7 +328,6 @@ private:
 	void					Event_PlayCycle( int channel, const char *name );
 	void					Event_IdleAnim( int channel, const char *name );
 	void					Event_SetSyncedAnimWeight( int channel, int anim, float weight );
-	void					Event_OverrideAnim( int channel );
 	void					Event_EnableAnim( int channel, int blendFrames );
 	void					Event_SetBlendFrames( int channel, int blendFrames );
 	void					Event_GetBlendFrames( int channel );

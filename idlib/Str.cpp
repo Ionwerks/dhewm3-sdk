@@ -753,26 +753,6 @@ idStr &idStr::SetFileExtension( const char *extension ) {
 	return *this;
 }
 
-// DG: helper-function that returns true if the character c is a directory separator
-//     on the current platform
-static ID_INLINE bool isDirSeparator( int c )
-{
-	if ( c == '/' ) {
-		return true;
-	}
-#ifdef _WIN32
-	if ( c == '\\' ) {
-		return true;
-	}
-#elif defined(__AROS__)
-	if ( c == ':' ) {
-		return true;
-	}
-#endif
-	return false;
-}
-// DG end
-
 /*
 ============
 idStr::StripFileExtension
@@ -782,10 +762,6 @@ idStr &idStr::StripFileExtension( void ) {
 	int i;
 
 	for ( i = len-1; i >= 0; i-- ) {
-		// DG: we're at a directory separator, nothing to strip at filename
-		if ( isDirSeparator( data[i] ) ) {
-			break;
-		} // DG end
 		if ( data[i] == '.' ) {
 			data[i] = '\0';
 			len = i;
@@ -802,9 +778,7 @@ idStr::StripAbsoluteFileExtension
 */
 idStr &idStr::StripAbsoluteFileExtension( void ) {
 	int i;
-	// FIXME DG: seems like this is unused, but it probably doesn't do what's expected
-	//           (if you wanna strip .tar.gz this will fail with dots in path,
-	//            if you indeed wanna strip the first dot in *path* (even in some directory) this is right)
+
 	for ( i = 0; i < len; i++ ) {
 		if ( data[i] == '.' ) {
 			data[i] = '\0';
@@ -826,10 +800,6 @@ idStr &idStr::DefaultFileExtension( const char *extension ) {
 
 	// do nothing if the string already has an extension
 	for ( i = len-1; i >= 0; i-- ) {
-		// DG: we're at a directory separator, there was no file extension
-		if ( isDirSeparator( data[i] ) ) {
-			break;
-		} // DG end
 		if ( data[i] == '.' ) {
 			return *this;
 		}
@@ -847,7 +817,11 @@ idStr::DefaultPath
 ==================
 */
 idStr &idStr::DefaultPath( const char *basepath ) {
-	if ( isDirSeparator( ( *this )[ 0 ] ) ) {
+#if defined(__AROS__)
+	if ( ( ( *this )[ 0 ] == '/' ) || ( ( *this )[ 0 ] == '\\' ) || ( ( *this )[ 0 ] == ':' ) ) {
+#else
+	if ( ( ( *this )[ 0 ] == '/' ) || ( ( *this )[ 0 ] == '\\' ) ) {
+#endif
 		// absolute path location
 		return *this;
 	}
@@ -870,12 +844,19 @@ void idStr::AppendPath( const char *text ) {
 		EnsureAlloced( len + strlen( text ) + 2 );
 
 		if ( pos ) {
-			if ( !isDirSeparator( data[ pos-1 ] ) ) {
+#if defined(__AROS__)
+			if (( data[ pos-1 ] != '/' ) || ( data[ pos-1 ] != ':' )) {
+#else
+			if ( data[ pos-1 ] != '/' ) {
+#endif
 				data[ pos++ ] = '/';
 			}
 		}
-
-		if ( isDirSeparator( text[ i ] ) ) {
+#if defined(__AROS__)
+		if (( text[i] == '/' ) || ( text[i] == ':' )) {
+#else
+		if ( text[i] == '/' ) {
+#endif
 			i++;
 		}
 
@@ -900,7 +881,11 @@ idStr &idStr::StripFilename( void ) {
 	int pos;
 
 	pos = Length() - 1;
-	while( ( pos > 0 ) && !isDirSeparator( ( *this )[ pos ] ) ) {
+#if defined(__AROS__)
+	while( ( pos > 0 ) && ( ( *this )[ pos ] != '/' ) && ( ( *this )[ pos ] != '\\' ) && ( ( *this )[ pos ] != ':' ) ) {
+#else
+	while( ( pos > 0 ) && ( ( *this )[ pos ] != '/' ) && ( ( *this )[ pos ] != '\\' ) ) {
+#endif
 		pos--;
 	}
 
@@ -921,7 +906,11 @@ idStr &idStr::StripPath( void ) {
 	int pos;
 
 	pos = Length();
-	while( ( pos > 0 ) && !isDirSeparator( ( *this )[ pos - 1 ] ) ) {
+#if defined(__AROS__)
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' )  && ( ( *this )[ pos - 1 ] != ':' ) ) {
+#else
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) ) {
+#endif
 		pos--;
 	}
 
@@ -941,7 +930,11 @@ void idStr::ExtractFilePath( idStr &dest ) const {
 	// back up until a \ or the start
 	//
 	pos = Length();
-	while( ( pos > 0 ) &&  !isDirSeparator( ( *this )[ pos - 1 ] ) ) {
+#if defined(__AROS__)
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) && ( ( *this )[ pos - 1 ] != ':' ) ) {
+#else
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) ) {
+#endif
 		pos--;
 	}
 
@@ -960,7 +953,11 @@ void idStr::ExtractFileName( idStr &dest ) const {
 	// back up until a \ or the start
 	//
 	pos = Length() - 1;
-	while( ( pos > 0 ) && !isDirSeparator( ( *this )[ pos - 1 ] ) ) {
+#if defined(__AROS__)
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) && ( ( *this )[ pos - 1 ] != ':' ) ) {
+#else
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) ) {
+#endif
 		pos--;
 	}
 
@@ -980,7 +977,11 @@ void idStr::ExtractFileBase( idStr &dest ) const {
 	// back up until a \ or the start
 	//
 	pos = Length() - 1;
-	while( ( pos > 0 ) && !isDirSeparator( ( *this )[ pos - 1 ] ) ) {
+#if defined(__AROS__)
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) && ( ( *this )[ pos - 1 ] != ':' ) ) {
+#else
+	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '/' ) && ( ( *this )[ pos - 1 ] != '\\' ) ) {
+#endif
 		pos--;
 	}
 
@@ -1006,10 +1007,6 @@ void idStr::ExtractFileExtension( idStr &dest ) const {
 	pos = Length() - 1;
 	while( ( pos > 0 ) && ( ( *this )[ pos - 1 ] != '.' ) ) {
 		pos--;
-		if( isDirSeparator( ( *this )[ pos ] ) ) { // DG: check for directory separator
-			// no extension in the whole filename
-			dest.Empty();
-		} // DG end
 	}
 
 	if ( !pos ) {

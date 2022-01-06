@@ -157,6 +157,10 @@ idMover::idMover( void ) {
 	damage = 0.0f;
 	areaPortal = 0;
 	fl.networkSync = true;
+	//added for coop
+	fl.coopNetworkSync = true;
+	snapshotPriority = 2;
+	fl.useOldNetcode = false;
 }
 
 /*
@@ -1390,6 +1394,14 @@ idMover::Event_RemoveInitialSplineAngles
 ================
 */
 void idMover::Event_RemoveInitialSplineAngles( void ) {
+
+	// Nicemice: FIXME: do we need to transmit this event???
+	if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()) {
+
+		ServerSendEvent(EVENT_REMOVEINITIALSPLINEANGLES, NULL, false, -1);
+	}
+
+
 	idCurve_Spline<idVec3> *spline;
 	idAngles ang;
 
@@ -1411,6 +1423,16 @@ void idMover::Event_StartSpline( idEntity *splineEntity ) {
 
 	if ( !splineEntity ) {
 		return;
+	}
+
+	// Nicemice: added
+	if (gameLocal.isServer && gameLocal.mpGame.IsGametypeCoopBased()) {
+		idBitMsg     msg;
+		byte msgBuf[MAX_EVENT_PARAM_SIZE];
+		msg.Init(msgBuf, sizeof(msgBuf));
+
+		msg.WriteBits(gameLocal.GetSpawnId(splineEntity), 32);
+		ServerSendEvent(EVENT_STARTSPLINE, &msg, false, -1);
 	}
 
 	// Needed for savegames
@@ -1446,6 +1468,11 @@ idMover::Event_StopSpline
 ================
 */
 void idMover::Event_StopSpline( void ) {
+
+	if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer) {
+		ServerSendEvent(EVENT_STOPSPLINE, NULL, false, -1);
+	}
+
 	physicsObj.SetSpline( NULL, 0, 0, useSplineAngles );
 	splineEnt = NULL;
 }
@@ -1497,6 +1524,11 @@ void idMover::WriteToSnapshot( idBitMsgDelta &msg ) const {
 	msg.WriteBits( rot.stage, 3 );
 	WriteBindToSnapshot( msg );
 	WriteGUIToSnapshot( msg );
+	msg.WriteBits( IsHidden(), 1 );
+	//Nicemice OpenCoop
+	msg.WriteInt(acceltime);
+	msg.WriteInt(deceltime);
+	msg.WriteInt(move_time);
 }
 
 /*
@@ -1513,6 +1545,16 @@ void idMover::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	rot.stage = (moveStage_t) msg.ReadBits( 3 );
 	ReadBindFromSnapshot( msg );
 	ReadGUIFromSnapshot( msg );
+
+	if ( msg.ReadBits( 1 ) ) {
+		Hide();
+	} else {
+		Show();
+	}
+	//Nicemice OpenCoop
+	acceltime = msg.ReadInt();
+	deceltime = msg.ReadInt();
+	move_time = msg.ReadInt();
 
 	if ( msg.HasChanged() ) {
 		if ( move.stage != oldMoveStage ) {
@@ -1533,6 +1575,40 @@ idMover::SetPortalState
 void idMover::SetPortalState( bool open ) {
 	assert( areaPortal );
 	gameLocal.SetPortalState( areaPortal, open ? PS_BLOCK_NONE : PS_BLOCK_ALL );
+}
+
+/*
+================
+idMover::ClientReceiveEvent
+
+NICEMICE OpenCoop
+================
+*/
+bool idMover::ClientReceiveEvent(int event, int time, const idBitMsg& msg)
+{
+	switch (event)
+	{
+		case EVENT_STARTSPLINE: {
+			// Nicemice: undone
+			int spawnId = msg.ReadBits(32);
+			idEntityPtr< idEntity > entPtr;
+			if (!entPtr.SetSpawnId(spawnId)) {
+				return false;
+			}
+			Event_StartSpline(entPtr.GetEntity());
+			return true;
+		}
+		case EVENT_STOPSPLINE: {
+			Event_StopSpline();
+			return true;
+		}
+		case EVENT_REMOVEINITIALSPLINEANGLES: {
+			Event_RemoveInitialSplineAngles();
+			return true;
+		}
+	}
+
+	return idEntity::ClientReceiveEvent(event, time, msg);
 }
 
 /*
@@ -1597,6 +1673,10 @@ idElevator::idElevator( void ) {
 	lastTouchTime = 0;
 	returnFloor = 0;
 	returnTime = 0;
+	fl.networkSync = true;
+	fl.coopNetworkSync = true;
+	fl.useOldNetcode = true;
+
 }
 
 /*
@@ -2120,6 +2200,8 @@ idMover_Binary::idMover_Binary() {
 	areaPortal = 0;
 	blocked = false;
 	fl.networkSync = true;
+	fl.coopNetworkSync = true;
+	fl.useOldNetcode = true;
 }
 
 /*
@@ -2447,6 +2529,7 @@ void idMover_Binary::SetMoverState( moverState_t newstate, int time ) {
 			} else {
 				physicsObj.SetLinearInterpolation( 0, 0, 0, 0, pos1, pos2 );
 			}
+			
 			break;
 		}
 		case MOVER_2TO1: {
@@ -2605,6 +2688,7 @@ idMover_Binary::Event_Reached_BinaryMover
 */
 void idMover_Binary::Event_Reached_BinaryMover( void ) {
 
+	//server-side - Singleplayer stuff
 	if ( moverState == MOVER_1TO2 ) {
 		// reached pos2
 		idThread::ObjectMoveDone( move_thread, this );
@@ -2622,11 +2706,18 @@ void idMover_Binary::Event_Reached_BinaryMover( void ) {
 
 		if ( enabled && wait >= 0 && !spawnArgs.GetBool( "toggle" ) ) {
 			// return to pos1 after a delay
-			PostEventSec( &EV_Mover_ReturnToPos1, wait );
+			if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) { 
+				CS_PostEventSec( &EV_Mover_ReturnToPos1, wait ); //added this for coop
+			} else {
+				PostEventSec( &EV_Mover_ReturnToPos1, wait );
+			}
+			
 		}
 
 		// fire targets
-		ActivateTargets( moveMaster->GetActivator() );
+		if (!gameLocal.mpGame.IsGametypeCoopBased() || gameLocal.isServer) { //Don't activate targets in coop for clients
+			ActivateTargets( moveMaster->GetActivator() );
+		}
 
 		SetBlocked(false);
 	} else if ( moverState == MOVER_2TO1 ) {
@@ -2646,7 +2737,11 @@ void idMover_Binary::Event_Reached_BinaryMover( void ) {
 		}
 
 		if ( enabled && wait >= 0 && spawnArgs.GetBool( "continuous" ) ) {
-			PostEventSec( &EV_Activate, wait, this );
+			if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) { 
+				CS_PostEventSec( &EV_Activate, wait, this ); //Added for client-side coop
+			} else {
+				PostEventSec( &EV_Activate, wait, this );
+			}
 		}
 
 		SetBlocked(false);
@@ -2691,7 +2786,11 @@ void idMover_Binary::GotoPosition1( void ) {
 	if ( moverState == MOVER_1TO2 ) {
 		// use the physics times because this might be executed during the physics simulation
 		partial = physicsObj.GetLinearEndTime() - physicsObj.GetTime();
-		assert( partial >= 0 );
+		if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) { //avoid crash in coop
+			partial = 0;
+		} else {
+			assert( partial >= 0 );
+		}
 		if ( partial < 0 ) {
 			partial = 0;
 		}
@@ -2710,7 +2809,6 @@ idMover_Binary::GotoPosition2
 */
 void idMover_Binary::GotoPosition2( void ) {
 	int	partial;
-
 	// only the master should control this
 	if ( moveMaster != this ) {
 		moveMaster->GotoPosition2();
@@ -2723,7 +2821,6 @@ void idMover_Binary::GotoPosition2( void ) {
 		// already there, or on the way
 		return;
 	}
-
 	if ( moverState == MOVER_POS1 ) {
 		MatchActivateTeam( MOVER_1TO2, gameLocal.time );
 
@@ -2732,12 +2829,17 @@ void idMover_Binary::GotoPosition2( void ) {
 		return;
 	}
 
-
 	// only partway up before reversing
 	if ( moverState == MOVER_2TO1 ) {
 		// use the physics times because this might be executed during the physics simulation
 		partial = physicsObj.GetLinearEndTime() - physicsObj.GetTime();
-		assert( partial >= 0 );
+
+		if (gameLocal.isClient && gameLocal.mpGame.IsGametypeCoopBased()) { //avoid crash in coop
+			partial = 0;
+		} else {
+			assert( partial >= 0 );
+		}
+		
 		if ( partial < 0 ) {
 			partial = 0;
 		}
@@ -2795,15 +2897,14 @@ idMover_Binary::Use_BinaryMover
 */
 void idMover_Binary::Use_BinaryMover( idEntity *activator ) {
 	// only the master should be used
+
 	if ( moveMaster != this ) {
 		moveMaster->Use_BinaryMover( activator );
 		return;
 	}
-
 	if ( !enabled ) {
 		return;
 	}
-
 	activatedBy = activator;
 
 	if ( moverState == MOVER_POS1 ) {
@@ -2816,7 +2917,6 @@ void idMover_Binary::Use_BinaryMover( idEntity *activator ) {
 		ProcessEvent( &EV_Mover_OpenPortal );
 		return;
 	}
-
 	// if all the way up, just delay before coming down
 	if ( moverState == MOVER_POS2 ) {
 		idMover_Binary *slave;
@@ -2833,13 +2933,11 @@ void idMover_Binary::Use_BinaryMover( idEntity *activator ) {
 		}
 		return;
 	}
-
 	// only partway down before reversing
 	if ( moverState == MOVER_2TO1 ) {
 		GotoPosition2();
 		return;
 	}
-
 	// only partway up before reversing
 	if ( moverState == MOVER_1TO2 ) {
 		GotoPosition1();
@@ -3043,6 +3141,8 @@ void idMover_Binary::WriteToSnapshot( idBitMsgDelta &msg ) const {
 	physicsObj.WriteToSnapshot( msg );
 	msg.WriteBits( moverState, 3 );
 	WriteBindToSnapshot( msg );
+	// Nicemice OpenCoop: added
+	WriteHiddenToSnapshot(msg);
 }
 
 /*
@@ -3056,6 +3156,8 @@ void idMover_Binary::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	physicsObj.ReadFromSnapshot( msg );
 	moverState = (moverState_t) msg.ReadBits( 3 );
 	ReadBindFromSnapshot( msg );
+	// Nicemice OpenCoop: added
+	ReadHiddenFromSnapshot(msg);
 
 	if ( msg.HasChanged() ) {
 		if ( moverState != oldMoverState ) {
@@ -3135,6 +3237,9 @@ idDoor::idDoor( void ) {
 	syncLock.Clear();
 	companionDoor = NULL;
 	normalAxisIndex = 0;
+	fl.networkSync = true;
+	fl.coopNetworkSync = true;
+	fl.useOldNetcode = false;
 }
 
 /*
@@ -3356,6 +3461,15 @@ void idDoor::Think( void ) {
 
 /*
 ================
+idDoor::ClientPredictionThink 
+================
+*/
+void idDoor::ClientPredictionThink( void ) {
+	idEntity::Think();
+}
+
+/*
+================
 idDoor::PreBind
 ================
 */
@@ -3494,7 +3608,9 @@ void idDoor::Use( idEntity *other, idEntity *activator ) {
 				}
 			}
 		}
-		ActivateTargets( activator );
+		if (!gameLocal.mpGame.IsGametypeCoopBased() || gameLocal.isServer) { //not activate targets in coop for clients
+			ActivateTargets( activator );
+		}
 		Use_BinaryMover( activator );
 	}
 }
@@ -3808,7 +3924,14 @@ void idDoor::Event_Touch( idEntity *other, trace_t *trace ) {
 
 	if ( trigger && trace->c.id == trigger->GetId() ) {
 		if ( !IsNoTouch() && !IsLocked() && GetMoverState() != MOVER_1TO2 ) {
+			if (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isClient) {
+				if (GetMoverState() != MOVER_POS1) { //FIXME: more ductape
+					return;
+				}
+			} 
+
 			Use( this, other );
+
 		}
 	} else if ( sndTrigger && trace->c.id == sndTrigger->GetId() ) {
 		if ( other && other->IsType( idPlayer::Type ) && IsLocked() && gameLocal.time > nextSndTriggerTime ) {
@@ -3835,6 +3958,7 @@ void idDoor::Event_SpectatorTouch( idEntity *other, trace_t *trace ) {
 	if ( p->lastSpectateTeleport > gameLocal.time - 1000 ) {
 		return;
 	}
+
 	if ( trigger && !IsOpen() ) {
 		// teleport to the other side, center to the middle of the trigger brush
 		bounds = trigger->GetAbsBounds();
@@ -4328,6 +4452,8 @@ idMover_Periodic::WriteToSnapshot
 void idMover_Periodic::WriteToSnapshot( idBitMsgDelta &msg ) const {
 	physicsObj.WriteToSnapshot( msg );
 	WriteBindToSnapshot( msg );
+	// Nicemice OpenCoop: added
+	WriteHiddenToSnapshot(msg);
 }
 
 /*
@@ -4338,6 +4464,9 @@ idMover_Periodic::ReadFromSnapshot
 void idMover_Periodic::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	physicsObj.ReadFromSnapshot( msg );
 	ReadBindFromSnapshot( msg );
+
+	// Nicemice OpenCoop: added
+	ReadFromSnapshot(msg);
 
 	if ( msg.HasChanged() ) {
 		UpdateVisuals();

@@ -156,6 +156,7 @@ idWeapon::idWeapon() {
 	Clear();
 
 	fl.networkSync = true;
+	fl.coopNetworkSync = true;
 }
 
 /*
@@ -179,6 +180,13 @@ void idWeapon::Spawn( void ) {
 		// setup the world model
 		worldModel = static_cast< idAnimatedEntity * >( gameLocal.SpawnEntityType( idAnimatedEntity::Type, NULL ) );
 		worldModel.GetEntity()->fl.networkSync = true;
+		worldModel.GetEntity()->fl.coopNetworkSync = true;
+		gameLocal.RegisterCoopEntity(worldModel.GetEntity()); //just lol
+		worldModel.SetCoopId(gameLocal.GetCoopId(worldModel.GetEntity())); //Dirty dirty hack
+	}
+
+	if (gameLocal.mpGame.IsGametypeCoopBased())	{
+		worldModel.forceCoopEntity = true; //evil stuff here
 	}
 
 	thread = new idThread();
@@ -194,12 +202,14 @@ Only called at player spawn time, not each weapon switch
 ================
 */
 void idWeapon::SetOwner( idPlayer *_owner ) {
+
 	assert( !owner );
 	owner = _owner;
 	SetName( va( "%s_weapon", owner->name.c_str() ) );
 
 	if ( worldModel.GetEntity() ) {
 		worldModel.GetEntity()->SetName( va( "%s_weapon_worldmodel", owner->name.c_str() ) );
+		common->Printf("World model set..\n");
 	}
 }
 
@@ -1980,7 +1990,7 @@ void idWeapon::PresentWeapon( bool showViewModel ) {
 		gameRenderWorld->UpdateLightDef( worldMuzzleFlashHandle, &worldMuzzleFlash );
 
 		// wake up monsters with the flashlight
-		if ( !gameLocal.isMultiplayer && lightOn && !owner->fl.notarget ) {
+		if ( (!gameLocal.isMultiplayer || (gameLocal.mpGame.IsGametypeCoopBased() && gameLocal.isServer)) && lightOn && !owner->fl.notarget ) {
 			AlertMonsters();
 		}
 	}
@@ -2260,7 +2270,12 @@ idWeapon::WriteToSnapshot
 */
 void idWeapon::WriteToSnapshot( idBitMsgDelta &msg ) const {
 	msg.WriteBits( ammoClip, ASYNC_PLAYER_INV_CLIP_BITS );
-	msg.WriteBits( worldModel.GetSpawnId(), 32 );
+
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		msg.WriteBits( worldModel.GetCoopId(), 32 );
+	} else {
+		msg.WriteBits( worldModel.GetSpawnId(), 32 );
+	}
 	msg.WriteBits( lightOn, 1 );
 	msg.WriteBits( isFiring ? 1 : 0, 1 );
 }
@@ -2272,8 +2287,14 @@ idWeapon::ReadFromSnapshot
 */
 void idWeapon::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	ammoClip = msg.ReadBits( ASYNC_PLAYER_INV_CLIP_BITS );
-	worldModel.SetSpawnId( msg.ReadBits( 32 ) );
+	if (gameLocal.mpGame.IsGametypeCoopBased()) {
+		worldModel.SetCoopId( msg.ReadBits( 32 ) );
+	} else {
+		worldModel.SetSpawnId( msg.ReadBits( 32 ) );
+	}
+
 	bool snapLight = msg.ReadBits( 1 ) != 0;
+	
 	isFiring = msg.ReadBits( 1 ) != 0;
 
 	// WEAPON_NETFIRING is only turned on for other clients we're predicting. not for local client
@@ -2322,7 +2343,20 @@ bool idWeapon::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
 		}
 		case EVENT_CHANGESKIN: {
 			int index = gameLocal.ClientRemapDecl( DECL_SKIN, msg.ReadInt() );
-			renderEntity.customSkin = ( index != -1 ) ? static_cast<const idDeclSkin *>( declManager->DeclByIndex( DECL_SKIN, index ) ) : NULL;
+			//ugly to avoid crash in coop
+			if (index != -1) {
+				int declTypeCount = declManager->GetNumDecls(DECL_SKIN);
+				if (index < 0 || index >= declTypeCount) {
+					renderEntity.customSkin = NULL;
+					common->Warning("[COOP] index declType out of range at idWeapon::ClientReceiveEvent\n");
+				} else {
+					renderEntity.customSkin = static_cast<const idDeclSkin *>( declManager->DeclByIndex( DECL_SKIN, index ) );
+				}
+			} else {
+				renderEntity.customSkin = NULL;
+			}
+			//end ugly
+			//renderEntity.customSkin = ( index != -1 ) ? static_cast<const idDeclSkin *>( declManager->DeclByIndex( DECL_SKIN, index ) ) : NULL;
 			UpdateVisuals();
 			if ( worldModel.GetEntity() ) {
 				worldModel.GetEntity()->SetSkin( renderEntity.customSkin );
@@ -2886,7 +2920,9 @@ void idWeapon::Event_LaunchProjectiles( int num_projectiles, float spread, float
 	if ( gameLocal.isClient ) {
 
 		// predict instant hit projectiles
-		if ( projectileDict.GetBool( "net_instanthit" ) ) {
+		if ((gameLocal.localClientNum == owner->entityNumber) && gameLocal.mpGame.IsGametypeCoopBased() && projectileDict.GetBool( "self_clientside", "1" )) { //predict projectiles on local player only
+			ClientsideFireProjectile(num_projectiles, spread,  fuseOffset,launchPower, dmgPower, projectileDict);
+		} else 	if ( projectileDict.GetBool( "net_instanthit" ) ) {
 			float spreadRad = DEG2RAD( spread );
 			muzzle_pos = muzzleOrigin + playerViewAxis[ 0 ] * 2.0f;
 			for( i = 0; i < num_projectiles; i++ ) {
@@ -2931,6 +2967,7 @@ void idWeapon::Event_LaunchProjectiles( int num_projectiles, float spread, float
 			if ( projectileDict.GetBool( "net_instanthit" ) ) {
 				// don't synchronize this on top of the already predicted effect
 				ent->fl.networkSync = false;
+				ent->fl.coopNetworkSync = false;
 			}
 
 			proj = static_cast<idProjectile *>(ent);
@@ -3179,3 +3216,81 @@ idWeapon::ClientPredictionThink
 void idWeapon::ClientPredictionThink( void ) {
 	UpdateAnimation();
 }
+
+/*
+===============
+idWeapon::ClientsideFireProjectile
+===============
+*/
+
+void idWeapon::ClientsideFireProjectile( int num_projectiles, float spread, float fuseOffset, float launchPower, float dmgPower, const idDict &projectileDef) {
+	idProjectile	*proj;
+	idEntity		*ent;
+	idVec3			dir;
+	float			ang;
+	float			spin;
+	trace_t			tr;
+	idVec3			muzzle_pos;
+	int i;
+	idBounds		projBounds, ownerBounds;
+	float			distance;
+	idVec3			start;
+	idDict			args;
+
+	ownerBounds = owner->GetPhysics()->GetAbsBounds();
+
+	args.Clear();
+	args.Copy(projectileDef);
+	args.Set("clientside", "1");
+
+	float spreadRad = DEG2RAD( spread );
+	for( i = 0; i < num_projectiles; i++ ) {
+		ang = idMath::Sin( spreadRad * gameLocal.random.RandomFloat() );
+		spin = (float)DEG2RAD( 360.0f ) * gameLocal.random.RandomFloat();
+		dir = playerViewAxis[ 0 ] + playerViewAxis[ 2 ] * ( ang * idMath::Sin( spin ) ) - playerViewAxis[ 1 ] * ( ang * idMath::Cos( spin ) );
+		dir.Normalize();
+
+		if ( projectileEnt ) {
+			ent = projectileEnt;
+			ent->Show();
+			ent->Unbind();
+			projectileEnt = NULL;
+		} else {
+			gameLocal.SpawnEntityDef( args, &ent, false );
+		}
+
+		if ( !ent || !ent->IsType( idProjectile::Type ) ) {
+			const char *projectileName = weaponDef->dict.GetString( "def_projectile" );
+			gameLocal.Error( "'%s' is not an idProjectile", projectileName );
+		}
+
+		ent->fl.networkSync = false;
+
+		proj = static_cast<idProjectile *>(ent);
+		proj->Create( owner, muzzleOrigin, dir );
+
+		projBounds = proj->GetPhysics()->GetBounds().Rotate( proj->GetPhysics()->GetAxis() );
+
+		// make sure the projectile starts inside the bounding box of the owner
+		if ( i == 0 ) {
+			muzzle_pos = muzzleOrigin + playerViewAxis[ 0 ] * 2.0f;
+			// DG: sometimes the assertion in idBounds::operator-(const idBounds&) triggers
+			//     (would get bounding box with negative volume)
+			//     => check that before doing ownerBounds - projBounds (equivalent to the check in the assertion)
+			idVec3 obDiff = ownerBounds[1] - ownerBounds[0];
+			idVec3 pbDiff = projBounds[1] - projBounds[0];
+			bool boundsSubLegal =  obDiff.x > pbDiff.x && obDiff.y > pbDiff.y && obDiff.z > pbDiff.z;
+			if ( boundsSubLegal && ( ownerBounds - projBounds ).RayIntersection( muzzle_pos, playerViewAxis[0], distance ) ) {
+				start = muzzle_pos + distance * playerViewAxis[0];
+			} else {
+				start = ownerBounds.GetCenter();
+			}
+			gameLocal.clip.Translation( tr, start, muzzle_pos, proj->GetPhysics()->GetClipModel(), proj->GetPhysics()->GetClipModel()->GetAxis(), MASK_SHOT_RENDERMODEL, owner );
+			muzzle_pos = tr.endpos;
+		}
+
+		proj->Launch( muzzle_pos, dir, pushVelocity, fuseOffset, launchPower, dmgPower );
+	}
+
+	return;
+} 

@@ -50,7 +50,9 @@ typedef enum {
 	GAME_DM,
 	GAME_TOURNEY,
 	GAME_TDM,
-	GAME_LASTMAN
+	GAME_LASTMAN,
+	GAME_COOP, //added by Stradex for Coop
+	GAME_SURVIVAL //added by Stradex for Coop
 } gameType_t;
 
 typedef enum {
@@ -64,6 +66,7 @@ typedef struct mpPlayerState_s {
 	int				ping;			// player ping
 	int				fragCount;		// kills
 	int				teamFragCount;	// team kills
+	int				livesLeft;		// SURVIVAL: Lives reamaining
 	int				wins;			// wins
 	playerVote_t	vote;			// player's vote
 	bool			scoreBoardUp;	// toggle based on player scoreboard button, used to activate de-activate the scoreboard gui
@@ -78,6 +81,7 @@ const int MP_PLAYER_MINFRAGS = -100;
 const int MP_PLAYER_MAXFRAGS = 100;
 const int MP_PLAYER_MAXWINS	= 100;
 const int MP_PLAYER_MAXPING	= 999;
+const int MP_PLAYER_MAXLIVES = 100;
 
 typedef struct mpChatLine_s {
 	idStr			line;
@@ -242,6 +246,17 @@ public:
 
 	void			PlayerStats( int clientNum, char *data, const int len );
 
+	//specific coop functions
+	void			CreateNewCheckpoint (idVec3 pos);
+	void			WantUseCheckpoint( int clientNum );
+	void			WantAddCheckpoint( int clientNum , bool isGlobal=false);
+	void			WantNoClip( int clientNum );
+	void			IncrementFrags(idPlayer* player);
+	void			SavePersistentPlayersInfo( void );
+
+	idVec3			playerCheckpoints[ MAX_CLIENTS ]; //added for coop checkpoints
+	bool			playerUseCheckpoints[ MAX_CLIENTS ]; //added for coop checkpoints
+
 private:
 	static const char	*MPGuis[];
 	static const char	*ThrottleVars[];
@@ -355,6 +370,12 @@ private:
 	void			VoiceChat( const idCmdArgs &args, bool team );
 	void			DumpTourneyLine( void );
 	void			SuddenRespawn( void );
+
+
+public:
+	idStr			GetBestGametype( const char* map, const char* gametype ); //Added for COOP mod by Stradex
+	void			SetBestGametype( const char * map ); //Added for COOP mod by Stradex
+	bool            IsGametypeCoopBased( void ) const; //Added for COOP mod by Stradex
 };
 
 ID_INLINE idMultiplayerGame::gameState_t idMultiplayerGame::GetGameState( void ) const {

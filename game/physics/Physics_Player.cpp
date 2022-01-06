@@ -29,7 +29,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "sys/platform.h"
 #include "gamesys/SysCvar.h"
 #include "Entity.h"
+#include "Player.h"
 
+#include "physics/Physics_StaticMulti.h" //added for BFG Edition clientside movement
 #include "physics/Physics_Player.h"
 
 CLASS_DECLARATION( idPhysics_Actor, idPhysics_Player )
@@ -1626,20 +1628,6 @@ void idPhysics_Player::Restore( idRestoreGame *savefile ) {
 
 	savefile->ReadInt( (int &)waterLevel );
 	savefile->ReadInt( waterType );
-
-	/* DG: It can apparently happen that the player saves while the clipModel's axis are
-	 *     modified by idPush::TryRotatePushEntity() -> idPhysics_Player::Rotate() -> idClipModel::Link()
-	 *     Normally idPush seems to reset them to the identity matrix in the next frame,
-	 *     but apparently not when coming from a savegame.
-	 *     Usually clipModel->axis is the identity matrix, and if it isn't there's clipping bugs
-	 *     like CheckGround() reporting that it's steep even though the player is only trying to
-	 *     walk up normal stairs.
-	 *     Resetting the axis to mat3_identity when restoring a savegame works around that issue
-	 *     and makes sure players can go on playing if their savegame was "corrupted" by saving
-	 *     while idPush was active. See https://github.com/dhewm/dhewm3/issues/328 for more details */
-	if ( clipModel != nullptr ) {
-		clipModel->SetPosition( clipModel->GetOrigin(), mat3_identity );
-	}
 }
 
 /*
@@ -2035,6 +2023,83 @@ idPhysics_Player::ReadFromSnapshot
 ================
 */
 void idPhysics_Player::ReadFromSnapshot( const idBitMsgDelta &msg ) {
+
+	if (self && static_cast<idPlayer*>(self)->CanHaveClientsideMovement()) { //clientside movement netcode
+		
+		msg.ReadFloat(); //do nothing with data received
+		msg.ReadFloat();
+		msg.ReadFloat();
+		msg.ReadFloat( PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		msg.ReadFloat( PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		msg.ReadFloat( PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		msg.ReadDeltaFloat( current.origin[0] );
+		msg.ReadDeltaFloat( current.origin[1] );
+		msg.ReadDeltaFloat( current.origin[2] );
+		msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+
+		msg.ReadDeltaFloat( 0.0f );
+		msg.ReadBits( PLAYER_MOVEMENT_TYPE_BITS );
+		msg.ReadBits( PLAYER_MOVEMENT_FLAGS_BITS );
+		msg.ReadDeltaInt( 0 );
+
+	} else { //normal netcode
+
+		current.origin[0] = msg.ReadFloat();
+		current.origin[1] = msg.ReadFloat();
+		current.origin[2] = msg.ReadFloat();
+		current.velocity[0] = msg.ReadFloat( PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		current.velocity[1] = msg.ReadFloat( PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		current.velocity[2] = msg.ReadFloat( PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		current.localOrigin[0] = msg.ReadDeltaFloat( current.origin[0] );
+		current.localOrigin[1] = msg.ReadDeltaFloat( current.origin[1] );
+		current.localOrigin[2] = msg.ReadDeltaFloat( current.origin[2] );
+		current.pushVelocity[0] = msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		current.pushVelocity[1] = msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+		current.pushVelocity[2] = msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+
+		current.stepUp = msg.ReadDeltaFloat( 0.0f );
+		current.movementType = msg.ReadBits( PLAYER_MOVEMENT_TYPE_BITS );
+		current.movementFlags = msg.ReadBits( PLAYER_MOVEMENT_FLAGS_BITS );
+		current.movementTime = msg.ReadDeltaInt( 0 );
+
+		if ( clipModel ) {
+			clipModel->Link( gameLocal.clip, self, 0, current.origin, clipModel->GetAxis() );
+		}
+	}
+}
+
+/*
+================
+idPhysics_Player::WriteToEvent
+================
+*/
+void idPhysics_Player::WriteToEvent( idBitMsg &msg ) {
+	msg.WriteFloat( current.origin[0] );
+	msg.WriteFloat( current.origin[1] );
+	msg.WriteFloat( current.origin[2] );
+	msg.WriteFloat( current.velocity[0], PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+	msg.WriteFloat( current.velocity[1], PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+	msg.WriteFloat( current.velocity[2], PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+	msg.WriteDeltaFloat( current.origin[0], current.localOrigin[0] );
+	msg.WriteDeltaFloat( current.origin[1], current.localOrigin[1] );
+	msg.WriteDeltaFloat( current.origin[2], current.localOrigin[2] );
+	msg.WriteDeltaFloat( 0.0f, current.pushVelocity[0], PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+	msg.WriteDeltaFloat( 0.0f, current.pushVelocity[1], PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+	msg.WriteDeltaFloat( 0.0f, current.pushVelocity[2], PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
+	//msg.WriteDeltaFloat( 0.0f, current.stepUp );
+	//msg.WriteBits( current.movementType, PLAYER_MOVEMENT_TYPE_BITS );
+	//msg.WriteBits( current.movementFlags, PLAYER_MOVEMENT_FLAGS_BITS );
+	//msg.WriteDeltaInt( 0, current.movementTime );
+}
+
+/*
+================
+idPhysics_Player::ReadFromEvent
+================
+*/
+void idPhysics_Player::ReadFromEvent( const idBitMsg &msg ) {
 	current.origin[0] = msg.ReadFloat();
 	current.origin[1] = msg.ReadFloat();
 	current.origin[2] = msg.ReadFloat();
@@ -2047,12 +2112,102 @@ void idPhysics_Player::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	current.pushVelocity[0] = msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
 	current.pushVelocity[1] = msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
 	current.pushVelocity[2] = msg.ReadDeltaFloat( 0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS );
-	current.stepUp = msg.ReadDeltaFloat( 0.0f );
-	current.movementType = msg.ReadBits( PLAYER_MOVEMENT_TYPE_BITS );
-	current.movementFlags = msg.ReadBits( PLAYER_MOVEMENT_FLAGS_BITS );
-	current.movementTime = msg.ReadDeltaInt( 0 );
 
 	if ( clipModel ) {
 		clipModel->Link( gameLocal.clip, self, 0, current.origin, clipModel->GetAxis() );
 	}
+}
+
+/*
+================
+idPhysics_Player::ReadFromEvent
+================
+*/
+void idPhysics_Player::ClearFromEvent(const idBitMsg& msg) {
+	msg.ReadFloat();
+	msg.ReadFloat();
+	msg.ReadFloat();
+	msg.ReadFloat(PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS);
+	msg.ReadFloat(PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS);
+	msg.ReadFloat(PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS);
+	msg.ReadDeltaFloat(current.origin[0]);
+	msg.ReadDeltaFloat(current.origin[1]);
+	msg.ReadDeltaFloat(current.origin[2]);
+	msg.ReadDeltaFloat(0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS);
+	msg.ReadDeltaFloat(0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS);
+	msg.ReadDeltaFloat(0.0f, PLAYER_VELOCITY_EXPONENT_BITS, PLAYER_VELOCITY_MANTISSA_BITS);
+}
+
+/*
+================
+idPhysics_Player::GetClientOrigin
+================
+*/
+const idVec3 & idPhysics_Player::GetClientOrigin( void ) const {
+	return client.origin;
+}
+
+/*
+================
+idPhysics_Player::GetLinearVelocity
+================
+*/
+const idVec3 &idPhysics_Player::GetClientLinearVelocity( int id ) const {
+	return client.velocity;
+}
+
+
+/*
+========================
+idPhysics_Player::ClientPusherLocked
+========================
+*/
+bool idPhysics_Player::ClientPusherLocked( bool& justBecameUnlocked )
+{
+
+	bool hasPhysicsContact = false;
+	bool hasGroundContact = false;
+	for( int i = 0; i < contacts.Num(); i++ )
+	{
+	
+		idEntity* ent = gameLocal.entities[ contacts[i].entityNum ];
+		if( ent )
+		{
+			idPhysics* p = ent->GetPhysics();
+			if( p != NULL )
+			{
+				// Testing IsAtRest seems cleaner but there are edge cases of clients jumping right before a mover starts to move
+				if( p->IsType( idPhysics_Static::Type ) == false && p->IsType( idPhysics_StaticMulti::Type ) == false )
+				{
+					hasPhysicsContact = true;
+					
+					clientPusherLocked = true; // locked until you have a ground contact that isn't a non static phys obj
+					
+					/*
+					// HACK - Tomiko Reactor rotating disks screw up if server locks the pushed clients, but elevators need clients to be locked ( otherwise clients will clip through elevators )
+					if( strcmp( ent->GetName(), "cylinder_disk1" ) == 0 || strcmp( ent->GetName(), "cylinder_disk2" ) == 0 || strcmp( ent->GetName(), "cylinder_disk3" ) == 0 )
+					{
+						clientPusherLocked = false;
+					}
+					*/
+				}
+			}
+			if( contacts[i].normal * -gravityNormal > 0.0f )
+			{
+				hasGroundContact = true;
+			}
+		}
+	}
+	
+	justBecameUnlocked = false;
+	if( hasGroundContact && !hasPhysicsContact )
+	{
+		if( clientPusherLocked )
+		{
+			justBecameUnlocked = true;
+		}
+		clientPusherLocked = false;
+	}
+	
+	return clientPusherLocked;
 }

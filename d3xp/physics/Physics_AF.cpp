@@ -5414,10 +5414,24 @@ bool idPhysics_AF::CollisionImpulse( float timeStep, idAFBody *body, trace_t &co
 	impactInfo_t info;
 	idEntity *ent;
 
+	if (collision.c.entityNum < 0 || collision.c.entityNum >= MAX_GENTITIES || !gameLocal.entities[collision.c.entityNum]) {
+		common->DWarning("[COOP FATAL] invalid entity at idPhysics_AF::CollisionImpulse\n");
+		return false;
+	}
+
 	ent = gameLocal.entities[collision.c.entityNum];
 	if ( ent == self ) {
 		return false;
 	}
+
+	//Stradex: you know that at this point this shitty mod is full of duct-tape, don't you?
+	if (gameLocal.mpGame.IsGametypeCoopBased() && (FLOAT_IS_NAN(collision.endpos.x) || FLOAT_IS_NAN(collision.endpos.y) || FLOAT_IS_NAN(collision.endpos.z) ||
+		FLOAT_IS_NAN(collision.c.normal.x) || FLOAT_IS_NAN(collision.c.normal.y) || FLOAT_IS_NAN(collision.c.normal.z) ||
+		FLOAT_IS_NAN(collision.c.normal.x) ||  FLOAT_IS_NAN(collision.c.normal.y) ||  FLOAT_IS_NAN(collision.c.normal.z)) ) {
+		common->DWarning("[COOP FATAL] NAN Float at idPhysics_AF::CollisionImpulse\n");
+		return false;
+	}
+
 
 	// get info from other entity involved
 	ent->GetImpactInfo( self, collision.c.id, collision.c.point, &info );
